@@ -28,7 +28,7 @@ from app.ingestion.domain import Feed
 
 class IngestionStatus(StrEnum):
     SUCCESS = "success"
-    SKIPPED = "skipped"  # content hash equal to the last successful run
+    SKIPPED = "skipped"  # content hash equal to the last successful run; nothing processed
     FAILED = "failed"
 
 
@@ -48,7 +48,8 @@ class Earthquake(Base):
         Geography(geometry_type="POINT", srid=4326, spatial_index=False)
     )
     region: Mapped[str] = mapped_column(Text)
-    tsunami_potential: Mapped[str | None] = mapped_column(Text)
+    # BMKG's free-text "Potensi", verbatim. Must never be labeled as tsunami information.
+    potential: Mapped[str | None] = mapped_column(Text)
     felt: Mapped[str | None] = mapped_column(Text)
     shakemap_url: Mapped[str | None] = mapped_column(Text)
     source_feeds: Mapped[list[str]] = mapped_column(ARRAY(Text))
@@ -79,6 +80,8 @@ class IngestionRun(Base):
     content_hash: Mapped[str | None] = mapped_column(Text)
     inserted_count: Mapped[int] = mapped_column(Integer, server_default="0")
     updated_count: Mapped[int] = mapped_column(Integer, server_default="0")
+    # Feed items the parser dropped as malformed (unrelated to the `skipped` status).
+    skipped_count: Mapped[int] = mapped_column(Integer, server_default="0")
     error: Mapped[str | None] = mapped_column(Text)
 
     __table_args__ = (

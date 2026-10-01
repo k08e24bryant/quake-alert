@@ -17,7 +17,7 @@ from tests.bmkg_samples import BASE_URL, load
 
 
 def test_autogempa_single_object_is_parsed_with_every_field() -> None:
-    [report] = parse_feed(Feed.AUTOGEMPA, load(Feed.AUTOGEMPA), BASE_URL)
+    [report] = parse_feed(Feed.AUTOGEMPA, load(Feed.AUTOGEMPA), BASE_URL).reports
 
     assert report.feed is Feed.AUTOGEMPA
     assert report.occurred_at == datetime(2026, 10, 1, 6, 24, 52, tzinfo=UTC)
@@ -25,14 +25,14 @@ def test_autogempa_single_object_is_parsed_with_every_field() -> None:
     assert report.depth_km == 25
     assert (report.latitude, report.longitude) == (Decimal("-2.46"), Decimal("140.38"))
     assert report.region == "Pusat gempa berada di darat 15 km Barat Laut Sentani"
-    assert report.tsunami_potential == "Gempa ini dirasakan untuk diteruskan pada masyarakat"
+    assert report.potential == "Gempa ini dirasakan untuk diteruskan pada masyarakat"
     assert report.felt == "II Kab. Jayapura"
     assert report.shakemap_url == ("https://data.bmkg.go.id/DataMKG/TEWS/20261001132452.mmi.jpg")
     assert report.raw == load(Feed.AUTOGEMPA)["Infogempa"]["gempa"]
 
 
-def test_gempaterkini_list_has_tsunami_potential_but_no_felt_or_shakemap() -> None:
-    reports = parse_feed(Feed.GEMPATERKINI, load(Feed.GEMPATERKINI), BASE_URL)
+def test_gempaterkini_list_has_potential_but_no_felt_or_shakemap() -> None:
+    reports = parse_feed(Feed.GEMPATERKINI, load(Feed.GEMPATERKINI), BASE_URL).reports
 
     assert len(reports) == 15
     first = reports[0]
@@ -41,13 +41,13 @@ def test_gempaterkini_list_has_tsunami_potential_but_no_felt_or_shakemap() -> No
     assert first.depth_km == 10
     assert (first.latitude, first.longitude) == (Decimal("4.74"), Decimal("125.30"))
     assert first.region == "127 km BaratLaut TAHUNA-KEP.SANGIHE-SULUT"
-    assert first.tsunami_potential == "Tidak berpotensi tsunami"
+    assert first.potential == "Tidak berpotensi tsunami"
     assert all(r.felt is None and r.shakemap_url is None for r in reports)
     assert all(r.magnitude >= 5 for r in reports)  # the feed is M5+ only
 
 
-def test_gempadirasakan_list_has_felt_but_no_tsunami_potential() -> None:
-    reports = parse_feed(Feed.GEMPADIRASAKAN, load(Feed.GEMPADIRASAKAN), BASE_URL)
+def test_gempadirasakan_list_has_felt_but_no_potential() -> None:
+    reports = parse_feed(Feed.GEMPADIRASAKAN, load(Feed.GEMPADIRASAKAN), BASE_URL).reports
 
     assert len(reports) == 15
     last = reports[-1]
@@ -56,7 +56,7 @@ def test_gempadirasakan_list_has_felt_but_no_tsunami_potential() -> None:
     assert last.depth_km == 7
     assert (last.latitude, last.longitude) == (Decimal("-6.90"), Decimal("107.11"))
     assert last.felt == "II - III Kota Cianjur, II - III Cibeber, II - III Warungkondang"
-    assert all(r.tsunami_potential is None for r in reports)
+    assert all(r.potential is None for r in reports)
 
 
 @pytest.mark.parametrize("feed", list(Feed))
@@ -65,9 +65,11 @@ def test_every_sample_item_parses_to_utc(feed: Feed) -> None:
     items = payload["Infogempa"]["gempa"]
     expected = 1 if isinstance(items, dict) else len(items)
 
-    reports = parse_feed(feed, payload, BASE_URL)
+    parsed = parse_feed(feed, payload, BASE_URL)
+    reports = parsed.reports
 
     assert len(reports) == expected
+    assert parsed.skipped_count == 0
     assert all(r.occurred_at.utcoffset() is not None for r in reports)
     assert all(r.occurred_at.tzinfo is UTC for r in reports)
 
@@ -76,7 +78,7 @@ def test_local_tanggal_and_jam_are_ignored_in_favour_of_utc_datetime() -> None:
     payload = copy.deepcopy(load(Feed.AUTOGEMPA))
     payload["Infogempa"]["gempa"]["Jam"] = "23:59:59 WIB"
 
-    [report] = parse_feed(Feed.AUTOGEMPA, payload, BASE_URL)
+    [report] = parse_feed(Feed.AUTOGEMPA, payload, BASE_URL).reports
 
     assert report.occurred_at == datetime(2026, 10, 1, 6, 24, 52, tzinfo=UTC)
 
@@ -86,9 +88,10 @@ def test_malformed_item_is_skipped_and_the_rest_are_kept() -> None:
     payload["Infogempa"]["gempa"][3]["Magnitude"] = "not a number"
     del payload["Infogempa"]["gempa"][7]["Coordinates"]
 
-    reports = parse_feed(Feed.GEMPATERKINI, payload, BASE_URL)
+    parsed = parse_feed(Feed.GEMPATERKINI, payload, BASE_URL)
 
-    assert len(reports) == 13
+    assert len(parsed.reports) == 13
+    assert parsed.skipped_count == 2
 
 
 @pytest.mark.parametrize(
@@ -104,7 +107,7 @@ def test_blank_optional_fields_become_none() -> None:
     payload = copy.deepcopy(load(Feed.AUTOGEMPA))
     payload["Infogempa"]["gempa"].update({"Dirasakan": " ", "Shakemap": ""})
 
-    [report] = parse_feed(Feed.AUTOGEMPA, payload, BASE_URL)
+    [report] = parse_feed(Feed.AUTOGEMPA, payload, BASE_URL).reports
 
     assert report.felt is None
     assert report.shakemap_url is None

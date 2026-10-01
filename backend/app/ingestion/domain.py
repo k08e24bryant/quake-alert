@@ -16,6 +16,10 @@ class Feed(StrEnum):
     GEMPADIRASAKAN = "gempadirasakan"  # latest 15 felt quakes
 
 
+# When feeds disagree about a quake, the earlier feed in this tuple wins.
+FEED_PRECEDENCE: tuple[Feed, ...] = (Feed.AUTOGEMPA, Feed.GEMPATERKINI, Feed.GEMPADIRASAKAN)
+
+
 @dataclass(frozen=True, slots=True)
 class QuakeReport:
     """One quake as reported by one feed, parsed into proper types."""
@@ -27,7 +31,8 @@ class QuakeReport:
     latitude: Decimal
     longitude: Decimal
     region: str
-    tsunami_potential: str | None
+    # BMKG's free-text "Potensi", verbatim. NOT necessarily tsunami information.
+    potential: str | None
     felt: str | None
     shakemap_url: str | None
     raw: dict[str, Any]

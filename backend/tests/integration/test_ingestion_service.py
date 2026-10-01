@@ -173,3 +173,21 @@ async def test_unparseable_payload_is_a_failed_run_and_stores_nothing(
     assert (by_feed[Feed.GEMPATERKINI].error or "").startswith("BmkgParseError")
     terkini_run = next(r for r in await runs(session_factory) if r.feed is Feed.GEMPATERKINI)
     assert terkini_run.content_hash == content_hash({"unexpected": "shape"})
+
+
+async def test_malformed_items_are_counted_in_skipped_count(
+    session_factory: Factory, bmkg_client: BmkgClient, respx_mock: respx.MockRouter
+) -> None:
+    terkini = copy.deepcopy(load(Feed.GEMPATERKINI))
+    terkini["Infogempa"]["gempa"][0]["Magnitude"] = "?"
+    del terkini["Infogempa"]["gempa"][1]["DateTime"]
+    serve(respx_mock, {**real_samples(), Feed.GEMPATERKINI: terkini})
+
+    results = await ingest_all_feeds(session_factory, bmkg_client, SETTINGS)
+
+    by_feed = {r.feed: r for r in results}
+    assert by_feed[Feed.GEMPATERKINI].status is IngestionStatus.SUCCESS
+    assert by_feed[Feed.GEMPATERKINI].inserted_count == 13
+    assert by_feed[Feed.GEMPATERKINI].skipped_count == 2
+    recorded = {r.feed: r.skipped_count for r in await runs(session_factory)}
+    assert recorded == {Feed.AUTOGEMPA: 0, Feed.GEMPATERKINI: 2, Feed.GEMPADIRASAKAN: 0}

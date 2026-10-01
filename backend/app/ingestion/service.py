@@ -25,7 +25,13 @@ class FeedIngestionResult:
     status: IngestionStatus
     inserted_count: int = 0
     updated_count: int = 0
+    skipped_count: int = 0  # malformed items the parser dropped
     error: str | None = None
+
+
+# How "the latest run" is chosen everywhere (content-hash skip, retention guard). The id
+# tiebreak keeps the choice deterministic if two runs share a fetched_at.
+LATEST_RUN_FIRST = (IngestionRun.fetched_at.desc(), IngestionRun.id.desc())
 
 
 def content_hash(payload: Any) -> str:
@@ -91,6 +97,7 @@ async def ingest_feed_payload(
             "status": result.status.value,
             "inserted": result.inserted_count,
             "updated": result.updated_count,
+            "skipped_items": result.skipped_count,
         },
     )
     return result
@@ -100,15 +107,14 @@ async def _store_reports(
     session: AsyncSession, feed: Feed, payload: Any, settings: Settings
 ) -> FeedIngestionResult:
     config = DedupConfig.from_settings(settings)
-    outcomes = [
-        await upsert_report(session, report, config)
-        for report in parse_feed(feed, payload, settings.bmkg_base_url)
-    ]
+    parsed = parse_feed(feed, payload, settings.bmkg_base_url)
+    outcomes = [await upsert_report(session, report, config) for report in parsed.reports]
     return FeedIngestionResult(
         feed,
         IngestionStatus.SUCCESS,
         inserted_count=outcomes.count(UpsertOutcome.INSERTED),
         updated_count=outcomes.count(UpsertOutcome.UPDATED),
+        skipped_count=parsed.skipped_count,
     )
 
 
@@ -116,7 +122,7 @@ async def _last_successful_hash(session: AsyncSession, feed: Feed) -> str | None
     return await session.scalar(
         select(IngestionRun.content_hash)
         .where(IngestionRun.feed == feed, IngestionRun.status == IngestionStatus.SUCCESS)
-        .order_by(IngestionRun.fetched_at.desc())
+        .order_by(*LATEST_RUN_FIRST)
         .limit(1)
     )
 
@@ -146,5 +152,6 @@ def _run_row(result: FeedIngestionResult, fetched_at: datetime, digest: str | No
         content_hash=digest,
         inserted_count=result.inserted_count,
         updated_count=result.updated_count,
+        skipped_count=result.skipped_count,
         error=result.error,
     )

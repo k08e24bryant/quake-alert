@@ -12,6 +12,7 @@ Tanggal/Jam (local WIB time) and Lintang/Bujur (duplicate Coordinates) are ignor
 
 import logging
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -28,7 +29,13 @@ class BmkgParseError(ValueError):
     """The payload or one of its items does not have the expected shape."""
 
 
-def parse_feed(feed: Feed, payload: Any, shakemap_base_url: str) -> list[QuakeReport]:
+@dataclass(frozen=True, slots=True)
+class ParsedFeed:
+    reports: list[QuakeReport]
+    skipped_count: int  # malformed items that were logged and dropped
+
+
+def parse_feed(feed: Feed, payload: Any, shakemap_base_url: str) -> ParsedFeed:
     """Parse a whole feed. Malformed items are logged and skipped; a payload whose
     envelope is wrong raises BmkgParseError."""
     try:
@@ -49,7 +56,7 @@ def parse_feed(feed: Feed, payload: Any, shakemap_base_url: str) -> list[QuakeRe
                 "skipping malformed BMKG item",
                 extra={"feed": feed.value, "index": index, "error": str(exc)},
             )
-    return reports
+    return ParsedFeed(reports=reports, skipped_count=len(items) - len(reports))
 
 
 def parse_item(feed: Feed, item: Any, shakemap_base_url: str) -> QuakeReport:
@@ -65,7 +72,7 @@ def parse_item(feed: Feed, item: Any, shakemap_base_url: str) -> QuakeReport:
         latitude=latitude,
         longitude=longitude,
         region=_required(item, "Wilayah"),
-        tsunami_potential=_optional(item, "Potensi"),
+        potential=_optional(item, "Potensi"),
         felt=_optional(item, "Dirasakan"),
         shakemap_url=f"{shakemap_base_url.rstrip('/')}/{shakemap}" if shakemap else None,
         raw=item,
