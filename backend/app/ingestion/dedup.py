@@ -74,6 +74,15 @@ class UpsertOutcome(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class UpsertResult:
+    outcome: UpsertOutcome
+    earthquake_id: uuid.UUID  # the row the report resolved to (inserted or matched)
+    # A derived column (time, magnitude, location, ...) was set or changed: what alert
+    # matching depends on. False for UNCHANGED, SKIPPED and updates that only touched `raw`.
+    fields_changed: bool
+
+
+@dataclass(frozen=True, slots=True)
 class DedupConfig:
     max_time_diff: timedelta
     max_distance_m: float
@@ -148,7 +157,7 @@ async def upsert_report(
     report: QuakeReport,
     config: DedupConfig,
     claimed: set[uuid.UUID] | None = None,
-) -> UpsertOutcome:
+) -> UpsertResult:
     """Insert or merge one report.
 
     `claimed` holds the rows already resolved by earlier items of the same feed snapshot;
@@ -159,7 +168,7 @@ async def upsert_report(
     if match is None:
         row_id = await _insert(session, report, config)
         claimed.add(row_id)
-        return UpsertOutcome.INSERTED
+        return UpsertResult(UpsertOutcome.INSERTED, row_id, fields_changed=True)
     claimed.add(match.row.id)
     return _merge(match, report, config)
 
@@ -256,7 +265,7 @@ def _salted_fingerprint(report: QuakeReport, n: int) -> str:
     return hashlib.sha256(f"{report.fingerprint}|{report.feed.value}|{n}".encode()).hexdigest()
 
 
-def _merge(match: _Match, report: QuakeReport, config: DedupConfig) -> UpsertOutcome:
+def _merge(match: _Match, report: QuakeReport, config: DedupConfig) -> UpsertResult:
     row = match.row
     raw = {**row.raw, report.feed.value: report.raw}
     try:
@@ -266,17 +275,21 @@ def _merge(match: _Match, report: QuakeReport, config: DedupConfig) -> UpsertOut
             "stored BMKG payload no longer parses; leaving row unchanged",
             extra={"earthquake_id": str(row.id), "feed": report.feed.value, "error": str(exc)},
         )
-        return UpsertOutcome.SKIPPED
+        return UpsertResult(UpsertOutcome.SKIPPED, row.id, fields_changed=False)
 
-    changed = False
-    for field, value in {**derived.columns, "raw": raw}.items():
+    fields_changed = False
+    for field, value in derived.columns.items():
         if getattr(row, field) != value:
             setattr(row, field, value)
-            changed = True
+            fields_changed = True
     if (match.latitude, match.longitude) != (derived.latitude, derived.longitude):
         row.location = derived.location
-        changed = True
-    return UpsertOutcome.UPDATED if changed else UpsertOutcome.UNCHANGED
+        fields_changed = True
+    raw_changed = row.raw != raw
+    if raw_changed:
+        row.raw = raw
+    outcome = UpsertOutcome.UPDATED if fields_changed or raw_changed else UpsertOutcome.UNCHANGED
+    return UpsertResult(outcome, row.id, fields_changed)
 
 
 def _select_match() -> Select[tuple[Earthquake, float, float]]:

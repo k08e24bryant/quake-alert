@@ -1,12 +1,16 @@
 import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
+import httpx
 import pytest
 from alembic import command
 from alembic.config import Config
+from arq import ArqRedis
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from redis.asyncio import Redis
 from sqlalchemy import URL, make_url, text
@@ -19,7 +23,13 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from app.core.config import Settings
+from app.ingestion.bmkg_client import BmkgClient
+from app.ingestion.freshness import StalenessMonitor
 from app.main import create_app
+from app.notifications.dispatcher import NotifyConfig
+from app.notifications.telegram import TelegramClient
+from tests import telegram_samples
+from tests.bmkg_samples import BASE_URL
 
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 
@@ -133,11 +143,23 @@ async def redis_client(integration_settings: IntegrationSettings) -> AsyncIterat
 
 
 @pytest.fixture
+async def arq_redis(
+    integration_settings: IntegrationSettings, redis_client: Redis
+) -> AsyncIterator[ArqRedis]:
+    """arq's client on the test Redis db (flushed by redis_client), for code that enqueues
+    jobs. Bytes in and out, unlike redis_client."""
+    redis = ArqRedis.from_url(integration_settings.test_redis_url)
+    yield redis
+    await redis.aclose()
+
+
+@pytest.fixture
 def app_settings(database_url: URL, integration_settings: IntegrationSettings) -> Settings:
     return Settings(
         environment="test",
         database_url=database_url.render_as_string(hide_password=False),
         redis_url=integration_settings.test_redis_url,
+        telegram_webhook_secret=SecretStr(telegram_samples.WEBHOOK_SECRET),
     )
 
 
@@ -169,3 +191,34 @@ async def api_app(
 async def api(api_app: FastAPI) -> AsyncIterator[AsyncClient]:
     async with AsyncClient(transport=ASGITransport(app=api_app), base_url="http://test") as c:
         yield c
+
+
+# What the worker runs with in tests: BMKG and Telegram are mocked with respx, and retries
+# don't sleep.
+WORKER_SETTINGS = Settings(
+    bmkg_base_url=BASE_URL,
+    bmkg_max_attempts=1,
+    bmkg_retry_backoff_seconds=0,
+    telegram_bot_token=SecretStr(telegram_samples.TOKEN),
+    telegram_api_base_url=telegram_samples.API_BASE,
+    notify_retry_backoff_seconds=2,
+)
+
+
+@pytest.fixture
+async def worker_ctx(
+    session_factory: async_sessionmaker[AsyncSession], arq_redis: ArqRedis
+) -> AsyncIterator[dict[str, Any]]:
+    """The arq ctx startup() builds, bound to the rolled-back test transaction. `redis` stands
+    in for arq's own connection; `job_try` is what arq sets for each run of a job."""
+    async with httpx.AsyncClient() as http:
+        yield {
+            "settings": WORKER_SETTINGS,
+            "session_factory": session_factory,
+            "bmkg_client": BmkgClient.from_settings(http, WORKER_SETTINGS),
+            "telegram": TelegramClient.from_settings(http, WORKER_SETTINGS),
+            "notify_config": NotifyConfig.from_settings(WORKER_SETTINGS),
+            "staleness_monitor": StalenessMonitor(),
+            "redis": arq_redis,
+            "job_try": 1,
+        }

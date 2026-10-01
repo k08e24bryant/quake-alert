@@ -83,13 +83,15 @@ because stored payloads are re-parsed on every merge.
 ## Query API
 
 Interactive docs are at `/docs` (OpenAPI at `/openapi.json`). Every response includes a
-`source` object attributing the data to BMKG.
+`source` object attributing the data to BMKG, with `data_as_of` (see
+[Ingestion freshness](#ingestion-freshness)).
 
 | Endpoint | Returns |
 |---|---|
 | `GET /v1/earthquakes` | A page of earthquakes, newest first, plus `next_cursor` |
 | `GET /v1/earthquakes/latest` | The most recent earthquake (404 if none yet) |
 | `GET /v1/earthquakes/{id}` | One earthquake (404 if unknown) |
+| `GET /v1/status` | Ingestion freshness per BMKG feed (never cached) |
 
 Filters for `GET /v1/earthquakes` (unknown parameters are rejected with 422):
 
@@ -139,7 +141,7 @@ shift or repeat later pages.
     one opens and recovers on its own, so a hung Redis costs up to *threshold* timeouts
     per process rather than in total. Nothing is shared or coordinated between them.
 
-**Rate limiting** applies to `/v1/*` only, per client IP, with a fixed window of
+**Rate limiting** applies to `/v1/*` (except the Telegram webhook) only, per client IP, with a fixed window of
 `RATE_LIMIT_PER_MINUTE` (60) requests per minute.
 - Every response carries `X-RateLimit-Limit`, `X-RateLimit-Remaining` and
   `X-RateLimit-Reset` (seconds until the window resets).
@@ -166,6 +168,182 @@ matching row is sorted by time before the page is cut. That is one reason `radiu
 capped at 1000. `tests/integration/test_query_plans.py` guards the index usage: it seeds
 20k rows, runs `ANALYZE`, and asserts that the radius query plan uses
 `ix_earthquakes_location` with no sequential scan.
+
+## Ingestion freshness
+
+`GET /v1/status` shows how current the data is, per BMKG feed:
+
+```json
+{
+  "ingestion_state": "ok",
+  "stale_after_minutes": 5,
+  "checked_at": "2026-10-01T13:18:16.645751+00:00",
+  "feeds": [
+    {"feed": "autogempa", "last_success_at": "2026-10-01T13:18:12.408593+00:00",
+     "last_run_status": "skipped", "last_run_at": "2026-10-01T13:18:12.408593+00:00"}
+  ],
+  "source": {"name": "BMKG (...)", "data_as_of": "2026-10-01T13:18:12.408593+00:00"}
+}
+```
+
+- A run is **successful** if its status is `success` or `skipped`. A skipped run fetched the
+  feed fine and found it unchanged, so the stored data is as current as BMKG's.
+- `ingestion_state` is `ok` when every feed had a successful run within
+  `INGESTION_STALE_AFTER_MINUTES` (5), otherwise `stale`. A feed that never ran is stale.
+- Every `/v1/earthquakes*` response carries `source.data_as_of`: the latest successful run
+  across all feeds. It is read before the data, so the data is at least that new. A cached
+  response keeps the value from when it was cached (at most `CACHE_*_TTL_SECONDS` older).
+- Everything is read from `ingestion_runs` in PostgreSQL, never Redis, and `/v1/status` is
+  never cached.
+- The worker logs `BMKG ingestion is stale` (WARNING) once when the state flips to stale, and
+  `BMKG ingestion recovered` (INFO) once when it flips back. Nothing is logged per poll.
+  The state lives in the worker process. A worker that starts while ingestion is already
+  stale logs it once; one that starts fresh logs nothing. If the worker itself is down,
+  nothing logs, which is why `/v1/status` is what external monitoring should poll.
+
+## Notifications (Telegram)
+
+Subscribers talk to a Telegram bot. The Bot API is called directly with httpx; there is no
+SDK.
+
+### Bot commands
+
+| Input | Effect |
+|---|---|
+| `/start` | What the bot does, the commands, the disclaimer, and a "share location" button |
+| Location pin | Creates the chat's subscription (radius 200 km, min M4.0), or moves it and keeps the settings |
+| `/radius <km>` | Whole km, 10–1000 |
+| `/minmag <value>` | 2.0–9.0, at most one decimal; `4,5` (decimal comma) is accepted |
+| `/list` | Location, radius, minimum magnitude, active or not |
+| `/stop` | **Hard-deletes** the chat's subscription and all its deliveries, pending ones included |
+
+- There is one subscription per chat. Invalid arguments get the expected format back and
+  change nothing.
+- Only private chats are served. Group and channel messages, and update types the bot
+  doesn't handle, are acknowledged and ignored.
+- The bot speaks Indonesian, as BMKG does. Wording rules: no emoji, no alarming words, and
+  never "peringatan dini". This is not an early-warning system, and the disclaimer on
+  `/start` says so. A test checks every text the bot can send against these rules.
+
+**Privacy:**
+- Coordinates are rounded to 2 decimals (about 1 km) **before** they are stored. The exact
+  pin is never saved.
+- Chat ids are never logged.
+- `/stop` deletes everything about the chat.
+
+### Receiving updates
+
+**Production: webhook.** `POST /v1/telegram/webhook` only accepts requests whose
+`X-Telegram-Bot-Api-Secret-Token` header equals `TELEGRAM_WEBHOOK_SECRET` (constant-time
+comparison). It answers 403 otherwise, and rejects everything if no secret is configured.
+- The bot's reply goes back in the HTTP response as a `sendMessage` call, which Telegram
+  executes. The API process therefore never needs the bot token.
+- The endpoint is not rate limited: every request comes from Telegram, and a 429 would only
+  make it retry.
+- A malformed update is acknowledged with 200, so Telegram doesn't redeliver it forever.
+
+Register the webhook once:
+
+```sh
+curl "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook" \
+  -d url=https://<your-domain>/v1/telegram/webhook \
+  -d secret_token=$TELEGRAM_WEBHOOK_SECRET \
+  -d 'allowed_updates=["message"]'
+```
+
+**Development: polling.** No public HTTPS URL is needed. Telegram refuses `getUpdates` while
+a webhook is set, so delete the webhook first:
+
+```sh
+curl "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/deleteWebhook"
+cd backend && uv run python -m scripts.telegram_polling   # reads backend/.env
+```
+
+The script long-polls `getUpdates`, handles each update with the same code as the webhook,
+and sends the replies with `sendMessage`. It refuses to run with `ENVIRONMENT=production`.
+
+### From a new quake to a message
+
+1. **Trigger.** After each feed commit, ingestion enqueues one `match_earthquakes` job with
+   the rows that were **inserted**, or **updated in a derived column** (time, magnitude,
+   location, depth, region, felt, potential, shakemap). An update that only changed `raw`
+   (e.g. BMKG's local-time `Jam` field) triggers nothing.
+2. **Match**, in SQL, on the rows' current values in PostgreSQL (never a cache):
+   `is_active AND magnitude >= min_magnitude AND ST_DWithin(sub.location, quake.location,
+   radius_km * 1000)`. Only quakes whose `occurred_at` is within `NOTIFY_MAX_AGE_MINUTES`
+   (30) are matched, so a first-run backfill of old quakes alerts nobody.
+   - Each match inserts a `pending` row into `notification_deliveries`. Its
+     `UNIQUE(subscription_id, earthquake_id)` with `ON CONFLICT DO NOTHING` means a row is
+     alerted at most once per subscriber, however often it is re-matched.
+   - That is also how **revisions** work. If BMKG raises a quake from M4.8 to M5.2, the
+     re-match creates a delivery for a subscriber with `/minmag 5`. Subscribers already
+     alerted at M4.8 get nothing new.
+3. **Send.** There is one `deliver_notification` arq job per new delivery, with job id
+   `delivery:<id>`.
+   - Before sending, the job re-checks that the quake is still within
+     `NOTIFY_MAX_AGE_MINUTES`. A delivery that was retried past the window is marked
+     `failed` ("expired before sending"), never sent late.
+   - Network errors, timeouts and 5xx are retried with exponential backoff:
+     `NOTIFY_RETRY_BACKOFF_SECONDS * 2**(n-1)` (5 s, 10 s, 20 s, ...), up to
+     `NOTIFY_MAX_ATTEMPTS` (5) tries.
+   - On **429**, the job waits exactly Telegram's `retry_after` instead.
+   - On **403** (the user blocked the bot), the subscription is deactivated and the delivery
+     fails without a retry. Any later command from that chat reactivates it.
+   - Any other 4xx fails without a retry.
+   - After the last try the delivery is `failed`, with the error in `last_error`. It never
+     stays `pending`.
+   - Errors stored or logged never contain the token, which is part of every Bot API URL.
+     The client builds its own messages and drops httpx's.
+4. **Safety net.** Every poll re-enqueues `pending` deliveries of fresh quakes, in case the
+   worker died between committing a delivery and enqueueing its job. The job id makes this
+   a no-op while the job is still queued, running or waiting to retry.
+
+Delivery is **at-least-once**. If Telegram accepted a message but recording `sent` failed,
+the retry sends it again. Per the safety principle, a duplicate beats a missed alert.
+
+### The message
+
+```
+Info gempa
+Magnitudo: 5.2
+Wilayah: Pusat gempa berada di laut 52 km BaratDaya Kab. Jayapura
+Waktu: 01 Okt 2026 13:24:52 WIB
+Kedalaman: 25 km
+Jarak dari lokasi Anda: sekitar 120 km
+Potensi (BMKG): Tidak berpotensi tsunami
+Shakemap: https://data.bmkg.go.id/DataMKG/TEWS/20261001132452.mmi.jpg
+Sumber: BMKG
+```
+
+- The time is in WIB (UTC+7, no daylight saving), as BMKG publishes it.
+- The distance is PostGIS `ST_Distance` on `geography`, from the subscriber's rounded
+  location.
+- `Potensi (BMKG)` is BMKG's text verbatim, and is omitted when BMKG gives none. It is never
+  labelled as tsunami information.
+- `Shakemap` appears only if BMKG has one.
+
+**Known duplicate rows.** Dedup sometimes keeps one event as two rows (see [Design
+decisions](#dedup-prefers-duplicates-over-wrong-merges)). If the subscriber was already
+**sent** an alert for another row within `NOTIFY_DUPLICATE_WINDOW_SECONDS` (120) **and**
+`NOTIFY_DUPLICATE_DISTANCE_KM` (100), the alert is still sent, never suppressed, but with a
+first line saying it may be the same event reported by another BMKG feed:
+
+```
+Catatan: mungkin kejadian yang sama dengan info gempa sebelumnya (01 Okt 2026 13:24:10 WIB), dilaporkan oleh feed BMKG lain.
+```
+
+### Out of scope / known gaps
+
+- **No revision messages.** After an alert is sent, later changes to the same row (a revised
+  magnitude, a new Potensi text, a shakemap) do not produce a follow-up message. The
+  subscriber keeps the values from the first alert.
+- **A lost match is not recovered.** If Redis fails after a feed commits but before its
+  match job is enqueued, those rows are never matched, and the error is logged. In practice
+  this needs Redis to die in the milliseconds between the two, and while Redis is down the
+  worker stops anyway (see below).
+- **Possible-duplicate prefix race.** The prefix depends on an earlier alert already being
+  `sent`. If the two rows are delivered at the same moment, neither gets the prefix.
+- **No retention for `notification_deliveries` yet.** It grows by one row per alert.
 
 ## Design decisions
 
@@ -204,9 +382,28 @@ ambiguous, dedup creates a new row:
   new row gets a salted fingerprint.
 
 Remaining duplicate risk: one quake reported at different seconds by the same feed over
-time, or reported by two feeds outside the fuzzy thresholds. Notification code (Phase 3)
-should therefore make a duplicate alert recognisable rather than assume rows are unique
-quakes.
+time, or reported by two feeds outside the fuzzy thresholds. Notifications therefore don't
+assume rows are unique quakes. An alert for a row close in time and place to one the
+subscriber already received is still sent, with a first line saying it may be the same
+event (see [The message](#the-message)).
+
+### Staleness is exposed, not a readiness failure
+
+When BMKG is unreachable, or the worker is down, the data stops getting newer. That is not a
+reason to take the API out of rotation. `/readyz` answers one question for the load
+balancer: can this instance serve requests? It still can. Failing readiness on stale
+ingestion would turn "the data is 20 minutes old" into "there is no data at all", for every
+instance at once, because they all read the same database. Restarting API instances
+wouldn't fix BMKG or the worker either.
+
+So staleness is reported as information:
+- `GET /v1/status` gives `ingestion_state` and per-feed times, for monitoring and for the
+  frontend.
+- Every data response carries `source.data_as_of`, so a client can show "data as of 13:18".
+- The worker logs the transition to stale and back once each, for alerting on logs.
+
+The history (what the API serves) stays correct while stale; it is just incomplete at the
+recent end.
 
 ### Fixed-window rate limiting allows bursts at window edges
 
@@ -235,8 +432,8 @@ choice: availability of quake data matters more than enforcing a per-client quot
 minutes.
 
 **Worker.** The worker is different: arq *is* Redis. Its cron schedule, job queue and
-retries all live there, so **while Redis is down, ingestion stops**. Notifications
-(Phase 3) will run as arq jobs as well and will stop too. Specifically:
+retries all live there, so **while Redis is down, ingestion stops**. Notifications are
+arq jobs too (matching and sending), so they stop as well. Specifically:
 
 - The worker process exits when it loses Redis. Docker Compose restarts it
   (`restart: unless-stopped`) until Redis is reachable again. Docker backs off between
@@ -253,10 +450,14 @@ What recovery does **not** cause:
   stored in **PostgreSQL**, not Redis, so it survives the outage: unchanged feeds are
   skipped. Changed feeds go through dedup, which is idempotent. Re-reading a quake already
   stored is `UNCHANGED`, never a second row.
-- **No stale alerts** (Phase 3 design, per `NOTIFY_MAX_AGE_MINUTES`). Alerts are sent only
-  for quakes whose `occurred_at` is within the freshness window (default 30 min). A quake
-  first ingested after a long outage is stored for the history and the API, but not pushed
-  to subscribers as if it were new.
+- **No stale alerts** (`NOTIFY_MAX_AGE_MINUTES`). Alerts are matched only for quakes whose
+  `occurred_at` is within the freshness window (default 30 min), and that window is checked
+  again right before sending. A quake first ingested after a long outage is stored for the
+  history and the API, but not pushed to subscribers as if it were new. A delivery whose
+  retries outlived the window is marked failed instead of being sent late.
+- **No double alerts.** `notification_deliveries` is unique per (subscription, row) and
+  lives in PostgreSQL, so re-matching after recovery creates nothing new. Deliveries left
+  `pending` by the outage are re-enqueued by the next poll while still fresh.
 
 What an outage **can** cost:
 
@@ -293,6 +494,12 @@ docker compose up --build
   - The body reports each component: `{"db": "ok" | "error", "redis": "ok" | "degraded"}`.
   - Redis is probed directly, not through the circuit breaker, with the short
     `REDIS_SOCKET_TIMEOUT_SECONDS` timeout, so a hung Redis can't stall the probe.
+- `GET /v1/status`: ingestion freshness. It is information, not a readiness signal (see
+  [Design decisions](#staleness-is-exposed-not-a-readiness-failure)).
+
+To try the bot locally, create a bot with @BotFather and put its token in `backend/.env` as
+`TELEGRAM_BOT_TOKEN`. The worker uses it to send alerts. Then run the polling script (see
+[Receiving updates](#receiving-updates)) and send `/start` to the bot.
 
 If ports 5432/6379/8000 are taken on your machine, set `POSTGRES_PORT`, `REDIS_PORT` or
 `API_PORT` in the root `.env`, and update the URLs in `backend/.env` to match.

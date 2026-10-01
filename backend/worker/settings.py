@@ -3,10 +3,18 @@ from typing import ClassVar
 from arq.connections import RedisSettings
 from arq.cron import CronJob, cron
 from arq.typing import WorkerCoroutine
+from arq.worker import Function, func
 
 from app.core.config import Settings, get_settings
 from app.core.logging import logging_config
-from worker.jobs import poll_bmkg_feeds, prune_old_ingestion_runs, shutdown, startup
+from worker.jobs import (
+    deliver_notification,
+    match_earthquakes,
+    poll_bmkg_feeds,
+    prune_old_ingestion_runs,
+    shutdown,
+    startup,
+)
 
 _settings: Settings = get_settings()
 
@@ -16,7 +24,11 @@ LOGGING_CONFIG = logging_config(_settings.log_level)
 
 
 class WorkerSettings:
-    functions: ClassVar[list[WorkerCoroutine]] = []
+    functions: ClassVar[list[Function | WorkerCoroutine]] = [
+        # Both jobs raise arq Retry themselves (with backoff), so max_tries caps the attempts.
+        func(match_earthquakes, max_tries=_settings.notify_max_attempts, timeout=60),
+        func(deliver_notification, max_tries=_settings.notify_max_attempts, timeout=60),
+    ]
     cron_jobs: ClassVar[list[CronJob]] = [
         cron(
             poll_bmkg_feeds,

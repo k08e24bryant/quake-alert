@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.api import earthquakes, health
+from app.api import earthquakes, health, status, telegram
 from app.core.circuit_breaker import CircuitBreaker
 from app.core.config import Settings, get_settings
 from app.core.logging import configure_logging
@@ -52,6 +52,8 @@ def create_app(
     app = FastAPI(title="Quake Alert", version="0.1.0", lifespan=lifespan)
     app.include_router(health.router)
     app.include_router(earthquakes.router)
+    app.include_router(status.router)
+    app.include_router(telegram.router)
     return app
 
 

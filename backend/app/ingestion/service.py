@@ -31,6 +31,9 @@ class FeedIngestionResult:
     # has a stored payload that no longer parses (that row is left unchanged).
     skipped_count: int = 0
     error: str | None = None
+    # Rows inserted, or updated in a derived column (not just `raw`): the rows whose alert
+    # matching may have changed.
+    changed_earthquake_ids: tuple[uuid.UUID, ...] = ()
 
 
 # How "the latest run" is chosen everywhere (content-hash skip, retention guard). The id
@@ -44,7 +47,7 @@ def content_hash(payload: Any) -> str:
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
-OnChange = Callable[[], Awaitable[None]]
+OnChange = Callable[[FeedIngestionResult], Awaitable[None]]
 
 
 async def ingest_all_feeds(
@@ -57,8 +60,8 @@ async def ingest_all_feeds(
 
     Processing is sequential on purpose: the same quake appears in several feeds, and
     concurrent upserts of near-duplicates (different fingerprints) could both insert.
-    `on_change` runs after each feed commit that inserted or updated rows (e.g. to
-    invalidate the API's `latest` cache).
+    `on_change` runs with the feed's result after each feed commit that inserted or updated
+    rows (e.g. to invalidate the API's `latest` cache and enqueue alert matching).
     """
     feeds = list(Feed)
     fetched_at = datetime.now(UTC)
@@ -69,7 +72,7 @@ async def ingest_all_feeds(
             raise payload  # cancellation and friends must propagate
         result = await ingest_feed_payload(session_factory, feed, payload, fetched_at, settings)
         if on_change is not None and (result.inserted_count or result.updated_count):
-            await on_change()
+            await on_change(result)
         results.append(result)
     return results
 
@@ -121,13 +124,15 @@ async def _store_reports(
     parsed = parse_feed(feed, payload, settings.bmkg_base_url)
     # Items of one snapshot are distinct quakes: none may resolve to a row another claimed.
     claimed: set[uuid.UUID] = set()
-    outcomes = [await upsert_report(session, report, config, claimed) for report in parsed.reports]
+    results = [await upsert_report(session, report, config, claimed) for report in parsed.reports]
+    outcomes = [result.outcome for result in results]
     return FeedIngestionResult(
         feed,
         IngestionStatus.SUCCESS,
         inserted_count=outcomes.count(UpsertOutcome.INSERTED),
         updated_count=outcomes.count(UpsertOutcome.UPDATED),
         skipped_count=parsed.skipped_count + outcomes.count(UpsertOutcome.SKIPPED),
+        changed_earthquake_ids=tuple(r.earthquake_id for r in results if r.fields_changed),
     )
 
 

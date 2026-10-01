@@ -1,29 +1,16 @@
 import uuid
 from datetime import UTC, datetime, timedelta
-from typing import Annotated, Self
+from typing import Self
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator, model_validator
-from pydantic.functional_serializers import PlainSerializer
 
 from app.earthquakes.pagination import Cursor, InvalidCursorError
+from app.schemas.common import SourceAttribution, UtcDatetime
 
 MAX_RADIUS_KM = 1000
 MAX_RANGE = timedelta(days=366)
 MAX_LIMIT = 100
 DEFAULT_LIMIT = 20
-
-# Always "+00:00", never "Z": the API contract is ISO 8601 with an explicit offset.
-UtcDatetime = Annotated[
-    datetime, PlainSerializer(lambda dt: dt.astimezone(UTC).isoformat(), return_type=str)
-]
-
-
-class SourceAttribution(BaseModel):
-    """BMKG requires attribution wherever its data is shown."""
-
-    name: str = "BMKG (Badan Meteorologi, Klimatologi, dan Geofisika)"
-    url: str = "https://data.bmkg.go.id/"
-    notice: str = "Earthquake data from BMKG Open Data."
 
 
 class Earthquake(BaseModel):
@@ -57,12 +44,12 @@ class EarthquakeList(BaseModel):
     next_cursor: str | None = Field(
         description="Pass as `cursor` to get the next page. Null on the last page."
     )
-    source: SourceAttribution = SourceAttribution()
+    source: SourceAttribution
 
 
 class EarthquakeDetail(BaseModel):
     data: Earthquake
-    source: SourceAttribution = SourceAttribution()
+    source: SourceAttribution
 
 
 class EarthquakeQuery(BaseModel):

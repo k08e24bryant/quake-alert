@@ -15,6 +15,7 @@ SOURCE = {
     "name": "BMKG (Badan Meteorologi, Klimatologi, dan Geofisika)",
     "url": "https://data.bmkg.go.id/",
     "notice": "Earthquake data from BMKG Open Data.",
+    "data_as_of": None,  # no ingestion_runs in these tests; see test_status.py
 }
 
 

@@ -13,6 +13,8 @@ from app.db.models import Earthquake as EarthquakeRow
 from app.earthquakes import cache
 from app.earthquakes.cache import CacheStatus
 from app.earthquakes.pagination import Cursor
+from app.ingestion.freshness import read_data_as_of
+from app.schemas.common import SourceAttribution
 from app.schemas.earthquakes import Earthquake, EarthquakeDetail, EarthquakeList, EarthquakeQuery
 
 _NEWEST_FIRST = (EarthquakeRow.occurred_at.desc(), EarthquakeRow.id.desc())
@@ -89,13 +91,14 @@ class EarthquakeService:
         if cached is not None:
             return EarthquakeList.model_validate_json(cached), status
 
+        source = await self._source()
         rows = (await self._session.execute(build_list_query(params))).mappings().all()
         page = [Earthquake.model_validate(row) for row in rows[: params.limit]]
         next_cursor = None
         if len(rows) > params.limit:
             last = page[-1]
             next_cursor = Cursor(last.occurred_at, last.id).encode()
-        result = EarthquakeList(data=page, next_cursor=next_cursor)
+        result = EarthquakeList(data=page, next_cursor=next_cursor, source=source)
 
         if status is not CacheStatus.BYPASS:
             await cache.write(
@@ -108,6 +111,7 @@ class EarthquakeService:
         if cached is not None:
             return EarthquakeDetail.model_validate_json(cached), status
 
+        source = await self._source()
         row = (
             (await self._session.execute(select(*_columns(None)).order_by(*_NEWEST_FIRST).limit(1)))
             .mappings()
@@ -115,7 +119,7 @@ class EarthquakeService:
         )
         if row is None:
             return None, status
-        result = EarthquakeDetail(data=Earthquake.model_validate(row))
+        result = EarthquakeDetail(data=Earthquake.model_validate(row), source=source)
         if status is not CacheStatus.BYPASS:
             await cache.write(
                 self._redis,
@@ -126,6 +130,7 @@ class EarthquakeService:
         return result, status
 
     async def get(self, earthquake_id: uuid.UUID) -> EarthquakeDetail | None:
+        source = await self._source()
         row = (
             (
                 await self._session.execute(
@@ -135,4 +140,10 @@ class EarthquakeService:
             .mappings()
             .first()
         )
-        return EarthquakeDetail(data=Earthquake.model_validate(row)) if row else None
+        if row is None:
+            return None
+        return EarthquakeDetail(data=Earthquake.model_validate(row), source=source)
+
+    async def _source(self) -> SourceAttribution:
+        # Read before the data, so the data is at least as new as data_as_of says.
+        return SourceAttribution(data_as_of=await read_data_as_of(self._session))

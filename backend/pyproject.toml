@@ -58,7 +58,7 @@ known-third-party = ["alembic"]
 python_version = "3.12"
 strict = true
 plugins = ["pydantic.mypy"]
-files = ["app", "worker", "tests", "alembic"]
+files = ["app", "worker", "scripts", "tests", "alembic"]
 
 [tool.pydantic-mypy]
 init_forbid_extra = true

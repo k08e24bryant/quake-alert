@@ -61,7 +61,7 @@ async def snapshot(session: AsyncSession) -> dict[str, Any]:
 
 
 async def upsert_all(session: AsyncSession, *reports: QuakeReport) -> list[UpsertOutcome]:
-    return [await upsert_report(session, report, CONFIG) for report in reports]
+    return [(await upsert_report(session, report, CONFIG)).outcome for report in reports]
 
 
 async def reset(session: AsyncSession) -> None:
@@ -77,7 +77,7 @@ async def test_new_report_is_inserted_with_all_fields(db_session: AsyncSession) 
         Feed.AUTOGEMPA, felt="III Jayapura", potential="Tidak berpotensi tsunami", shakemap="1.jpg"
     )
 
-    assert await upsert_report(db_session, report, CONFIG) is UpsertOutcome.INSERTED
+    assert (await upsert_report(db_session, report, CONFIG)).outcome is UpsertOutcome.INSERTED
 
     row = await only_row(db_session)
     assert row.occurred_at == DEFAULT_TIME
@@ -206,7 +206,7 @@ async def test_revision_within_the_same_feed_is_applied(db_session: AsyncSession
     await upsert_report(db_session, make_report(Feed.AUTOGEMPA, magnitude="5.0"), CONFIG)
 
     revised = make_report(Feed.AUTOGEMPA, magnitude="5.3", depth_km=40)
-    assert await upsert_report(db_session, revised, CONFIG) is UpsertOutcome.UPDATED
+    assert (await upsert_report(db_session, revised, CONFIG)).outcome is UpsertOutcome.UPDATED
 
     row = await only_row(db_session)
     assert (row.magnitude, row.depth_km) == (Decimal("5.3"), 40)
@@ -220,12 +220,37 @@ async def test_revision_in_a_lower_feed_is_stored_but_does_not_override(
     await upsert_all(db_session, autogempa, dirasakan)
 
     revised = make_report(Feed.GEMPADIRASAKAN, magnitude="4.9", felt="V Kota D")
-    assert await upsert_report(db_session, revised, CONFIG) is UpsertOutcome.UPDATED
+    assert (await upsert_report(db_session, revised, CONFIG)).outcome is UpsertOutcome.UPDATED
 
     row = await only_row(db_session)
     assert row.magnitude == Decimal("5.3")  # still autogempa's
     assert row.felt == "V Kota D"  # only dirasakan has felt, so its revision shows
     assert row.raw["gempadirasakan"] == revised.raw
+
+
+# --- fields_changed: what alert matching is triggered by -------------------------------------
+
+
+async def test_insert_and_derived_revision_report_fields_changed(db_session: AsyncSession) -> None:
+    inserted = await upsert_report(db_session, make_report(Feed.AUTOGEMPA, magnitude="3.9"), CONFIG)
+    revised = await upsert_report(db_session, make_report(Feed.AUTOGEMPA, magnitude="4.2"), CONFIG)
+    again = await upsert_report(db_session, make_report(Feed.AUTOGEMPA, magnitude="4.2"), CONFIG)
+
+    assert (inserted.outcome, inserted.fields_changed) == (UpsertOutcome.INSERTED, True)
+    assert (revised.outcome, revised.fields_changed) == (UpsertOutcome.UPDATED, True)
+    assert (again.outcome, again.fields_changed) == (UpsertOutcome.UNCHANGED, False)
+    assert inserted.earthquake_id == revised.earthquake_id == again.earthquake_id
+
+
+async def test_raw_only_update_does_not_report_fields_changed(db_session: AsyncSession) -> None:
+    autogempa, dirasakan = conflicting_pair()
+    await upsert_all(db_session, autogempa, dirasakan)
+
+    # A lower-precedence feed revises its magnitude: stored in raw, but autogempa's still wins.
+    revised = make_report(Feed.GEMPADIRASAKAN, magnitude="4.8", felt=dirasakan.felt)
+    result = await upsert_report(db_session, revised, CONFIG)
+
+    assert (result.outcome, result.fields_changed) == (UpsertOutcome.UPDATED, False)
 
 
 async def test_optional_fields_survive_a_feed_that_lacks_them(db_session: AsyncSession) -> None:
@@ -346,7 +371,7 @@ def aftershock_pair(feed: Feed = Feed.GEMPATERKINI) -> tuple[QuakeReport, QuakeR
 async def upsert_snapshot(session: AsyncSession, *reports: QuakeReport) -> list[UpsertOutcome]:
     """Upsert reports as items of ONE feed snapshot (sharing the claimed-rows set)."""
     claimed: set[uuid.UUID] = set()
-    return [await upsert_report(session, report, CONFIG, claimed) for report in reports]
+    return [(await upsert_report(session, report, CONFIG, claimed)).outcome for report in reports]
 
 
 async def test_aftershocks_in_one_snapshot_are_two_rows(db_session: AsyncSession) -> None:
@@ -428,7 +453,7 @@ async def test_same_feed_revision_distance_guard_boundary(
         db_session, make_report(Feed.GEMPATERKINI, latitude=latitude), CONFIG
     )
 
-    assert outcome is expected, label
+    assert outcome.outcome is expected, label
 
 
 async def test_same_feed_revision_distance_comes_from_config(db_session: AsyncSession) -> None:
@@ -442,7 +467,7 @@ async def test_same_feed_revision_distance_comes_from_config(db_session: AsyncSe
     moved_25_km = make_report(Feed.GEMPATERKINI, latitude="-2.64", longitude="140.51")
 
     await upsert_report(db_session, original, tight)
-    assert await upsert_report(db_session, moved_25_km, tight) is UpsertOutcome.INSERTED
+    assert (await upsert_report(db_session, moved_25_km, tight)).outcome is UpsertOutcome.INSERTED
 
 
 async def test_revision_distance_is_measured_from_the_same_feeds_previous_position(
@@ -456,7 +481,9 @@ async def test_revision_distance_is_measured_from_the_same_feeds_previous_positi
 
     # ~95 km from gempaterkini's previous position (a revision), but ~140 km from the row.
     revised_terkini = make_report(Feed.GEMPATERKINI, latitude="-1.20")
-    assert await upsert_report(db_session, revised_terkini, CONFIG) is UpsertOutcome.UPDATED
+    assert (
+        await upsert_report(db_session, revised_terkini, CONFIG)
+    ).outcome is UpsertOutcome.UPDATED
     assert await count_rows(db_session) == 1
 
 
@@ -484,7 +511,9 @@ async def test_aftershock_of_a_cross_feed_merged_quake_gets_its_own_row(
     await upsert_all(db_session, main_terkini, main_dirasakan)
     assert await count_rows(db_session) == 1
 
-    assert await upsert_report(db_session, aftershock_terkini, CONFIG) is UpsertOutcome.INSERTED
+    assert (
+        await upsert_report(db_session, aftershock_terkini, CONFIG)
+    ).outcome is UpsertOutcome.INSERTED
 
     rows = (await db_session.scalars(select(Earthquake).order_by(Earthquake.occurred_at))).all()
     assert [(r.magnitude, r.source_feeds) for r in rows] == [
@@ -528,5 +557,5 @@ async def test_unparseable_stored_payload_leaves_the_row_unchanged(
         db_session, make_report(Feed.GEMPADIRASAKAN, felt="III Jayapura"), CONFIG
     )
 
-    assert outcome is UpsertOutcome.SKIPPED
+    assert outcome.outcome is UpsertOutcome.SKIPPED
     assert await snapshot(db_session) == before

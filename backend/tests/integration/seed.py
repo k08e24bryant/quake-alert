@@ -7,7 +7,7 @@ from decimal import Decimal
 from geoalchemy2 import WKTElement
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import Earthquake
+from app.db.models import Earthquake, Subscription, SubscriptionChannel
 from app.ingestion.domain import Feed
 from tests.bmkg_samples import DEFAULT_TIME, make_item
 
@@ -53,6 +53,29 @@ async def seed_quake(
         source_feeds=[feed.value],
         fingerprint=uuid.uuid4().hex,  # rows here may deliberately share time and place
         raw={feed.value: item},
+    )
+    session.add(row)
+    await session.flush()
+    return row
+
+
+async def seed_subscription(
+    session: AsyncSession,
+    *,
+    at: tuple[float, float] = JAKARTA,
+    radius_km: int = 200,
+    min_magnitude: str = "4.0",
+    is_active: bool = True,
+    chat_id: int | None = None,
+) -> Subscription:
+    lat, lon = at
+    row = Subscription(
+        channel=SubscriptionChannel.TELEGRAM,
+        telegram_chat_id=chat_id if chat_id is not None else uuid.uuid4().int % 10**12,
+        location=WKTElement(f"POINT({lon} {lat})", srid=4326),
+        radius_km=radius_km,
+        min_magnitude=Decimal(min_magnitude),
+        is_active=is_active,
     )
     session.add(row)
     await session.flush()

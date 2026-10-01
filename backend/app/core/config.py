@@ -1,7 +1,7 @@
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -44,6 +44,9 @@ class Settings(BaseSettings):
     # because the content-hash skip compares against it.
     ingestion_runs_retention_days: int = Field(default=14, ge=1)  # success and skipped runs
     ingestion_runs_failed_retention_days: int = Field(default=90, ge=1)
+    # Ingestion is "stale" (GET /v1/status) when some feed has had no successful run
+    # (status success or skipped) for this long.
+    ingestion_stale_after_minutes: int = Field(default=5, ge=1)
 
     # Query API caching. `latest` is also invalidated by ingestion; the TTL only bounds
     # staleness if an invalidation is missed (e.g. Redis briefly unreachable from the worker).
@@ -54,6 +57,27 @@ class Settings(BaseSettings):
     rate_limit_per_minute: int = Field(default=60, ge=1)
     # Only enable behind a proxy you control (Caddy): clients can forge X-Forwarded-For.
     trust_proxy_headers: bool = False
+
+    # Telegram Bot API, called directly with httpx. Empty = not configured: the webhook
+    # rejects every request and deliveries fail without calling Telegram.
+    telegram_bot_token: SecretStr = SecretStr("")
+    # Compared with the X-Telegram-Bot-Api-Secret-Token header on POST /v1/telegram/webhook;
+    # pass the same value as secret_token to setWebhook.
+    telegram_webhook_secret: SecretStr = SecretStr("")
+    telegram_api_base_url: str = "https://api.telegram.org"
+    telegram_timeout_seconds: float = Field(default=10.0, gt=0)
+
+    # Only quakes whose origin time is at most this old are notified, both when matching
+    # and when sending (a retry that ends up later than this gives up instead).
+    notify_max_age_minutes: int = Field(default=30, ge=1)
+    # Tries per delivery, including the first. Delay before retry n is backoff * 2**(n-1),
+    # except after a Telegram 429, which waits for its retry_after.
+    notify_max_attempts: int = Field(default=5, ge=1)
+    notify_retry_backoff_seconds: float = Field(default=5.0, ge=0)
+    # A subscriber already alerted for another row within BOTH of these is told the new
+    # alert may be the same event reported by another BMKG feed (dedup keeps such duplicates).
+    notify_duplicate_window_seconds: int = Field(default=120, ge=0)
+    notify_duplicate_distance_km: float = Field(default=100.0, ge=0)
 
 
 @lru_cache
