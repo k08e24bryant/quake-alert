@@ -138,7 +138,7 @@ class FakeClock:
 def clock(api_app: FastAPI) -> FakeClock:
     """Limit /v1 to 3 requests per minute with a controllable clock."""
     fake = FakeClock(WINDOW_START + 15)
-    api_app.state.rate_limiter = RateLimiter(api_app.state.redis, limit=3, clock=fake)
+    api_app.state.rate_limiter = RateLimiter(api_app.state.guarded_redis, limit=3, clock=fake)
     return fake
 
 

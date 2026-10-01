@@ -1,7 +1,8 @@
 """Per-client-IP fixed-window rate limiting in Redis.
 
-Fails open: if Redis is unreachable, requests are allowed (and logged), because the API
-must keep serving from the database when Redis is down.
+Fails open: if Redis is unreachable, requests are allowed, because the API must keep
+serving from the database when Redis is down. Calls go through the API's circuit breaker
+(GuardedRedis): while it is open, limiting is skipped without touching Redis or logging.
 """
 
 import ipaddress
@@ -14,6 +15,9 @@ from dataclasses import dataclass
 from fastapi import HTTPException, Request, Response, status
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
+
+from app.core.circuit_breaker import CircuitOpenError
+from app.core.redis import GuardedRedis
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +45,7 @@ class RateLimitDecision:
 class RateLimiter:
     def __init__(
         self,
-        redis: Redis,
+        redis: GuardedRedis,
         *,
         limit: int,
         window_seconds: int = 60,
@@ -57,11 +61,18 @@ class RateLimiter:
         now = self._clock()
         window = int(now // self._window)
         key = f"{KEY_PREFIX}{client}:{window}"
-        try:
-            async with self._redis.pipeline(transaction=True) as pipe:
+
+        async def count_hit(redis: Redis) -> int:
+            async with redis.pipeline(transaction=True) as pipe:
                 pipe.incr(key)
                 pipe.expire(key, self._window, nx=True)
                 count, _ = await pipe.execute()
+            return int(count)
+
+        try:
+            count = await self._redis.run(count_hit)
+        except CircuitOpenError:
+            return None
         except (RedisError, OSError) as exc:
             logger.warning("rate limiter unavailable, allowing request", extra={"error": repr(exc)})
             return None

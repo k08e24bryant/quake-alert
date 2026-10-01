@@ -3,7 +3,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 
-from app.api.deps import RedisDep, SessionDep, SettingsDep
+from app.api.deps import GuardedRedisDep, SessionDep, SettingsDep
 from app.core.rate_limit import enforce_rate_limit
 from app.earthquakes.cache import CacheStatus
 from app.earthquakes.service import EarthquakeService
@@ -17,7 +17,9 @@ router = APIRouter(
 )
 
 
-def get_service(session: SessionDep, redis: RedisDep, settings: SettingsDep) -> EarthquakeService:
+def get_service(
+    session: SessionDep, redis: GuardedRedisDep, settings: SettingsDep
+) -> EarthquakeService:
     return EarthquakeService(session, redis, settings)
 
 

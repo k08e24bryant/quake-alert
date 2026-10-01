@@ -6,6 +6,7 @@ from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from app.core.config import Settings
+from app.core.redis import GuardedRedis
 
 
 def get_settings_dep(request: Request) -> Settings:
@@ -29,7 +30,14 @@ async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
         yield session
 
 
+def get_guarded_redis(request: Request) -> GuardedRedis:
+    """The API's Redis behind its circuit breaker; use for all request-path Redis calls."""
+    guarded: GuardedRedis = request.app.state.guarded_redis
+    return guarded
+
+
 SettingsDep = Annotated[Settings, Depends(get_settings_dep)]
 EngineDep = Annotated[AsyncEngine, Depends(get_engine)]
 RedisDep = Annotated[Redis, Depends(get_redis)]
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
+GuardedRedisDep = Annotated[GuardedRedis, Depends(get_guarded_redis)]

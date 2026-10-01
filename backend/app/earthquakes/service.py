@@ -3,12 +3,12 @@
 import uuid
 from typing import Any
 
-from redis.asyncio import Redis
 from sqlalchemy import ColumnElement, DateTime, Float, Select, Uuid, func, literal, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import InstrumentedAttribute
 
 from app.core.config import Settings
+from app.core.redis import GuardedRedis
 from app.db.models import Earthquake as EarthquakeRow
 from app.earthquakes import cache
 from app.earthquakes.cache import CacheStatus
@@ -78,7 +78,7 @@ def _after(cursor: Cursor) -> ColumnElement[bool]:
 
 
 class EarthquakeService:
-    def __init__(self, session: AsyncSession, redis: Redis, settings: Settings) -> None:
+    def __init__(self, session: AsyncSession, redis: GuardedRedis, settings: Settings) -> None:
         self._session = session
         self._redis = redis
         self._settings = settings

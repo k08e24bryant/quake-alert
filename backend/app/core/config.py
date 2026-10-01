@@ -19,6 +19,10 @@ class Settings(BaseSettings):
     # Short, so a dead Redis degrades the API (cache bypass, no rate limiting) instead of
     # stalling every request.
     redis_socket_timeout_seconds: float = Field(default=0.5, gt=0)
+    # Circuit breaker around the API's Redis calls: after this many consecutive failures or
+    # timeouts, skip Redis entirely for REDIS_BREAKER_OPEN_SECONDS, then try one call.
+    redis_breaker_failure_threshold: int = Field(default=3, ge=1)
+    redis_breaker_open_seconds: float = Field(default=30.0, gt=0)
 
     readiness_timeout_seconds: float = 2.0
 

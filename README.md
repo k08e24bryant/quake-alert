@@ -126,6 +126,15 @@ shift or repeat later pages.
 - **If Redis is down**, the API answers from the database (`X-Cache: BYPASS`) and rate
   limiting is skipped. `/readyz` reports Redis as failing, but requests keep succeeding.
   Redis calls time out after `REDIS_SOCKET_TIMEOUT_SECONDS` (0.5).
+- **Circuit breaker:** all request-path Redis calls (cache and rate limit) go through an
+  in-process breaker (`app/core/circuit_breaker.py`).
+  - After `REDIS_BREAKER_FAILURE_THRESHOLD` (3) consecutive failures or timeouts, it opens
+    for `REDIS_BREAKER_OPEN_SECONDS` (30). While open, Redis is not contacted at all, so a
+    hung Redis costs a few timeouts in total instead of a timeout on every request.
+  - After the open period, exactly one trial call goes through: success closes the
+    breaker, failure reopens it for another full period.
+  - Only state changes are logged.
+  - `/readyz` bypasses the breaker on purpose: it has to probe Redis for real.
 
 **Rate limiting** applies to `/v1/*` only, per client IP, with a fixed window of
 `RATE_LIMIT_PER_MINUTE` (60) requests per minute.
@@ -195,6 +204,31 @@ Remaining duplicate risk: one quake reported at different seconds by the same fe
 time, or reported by two feeds outside the fuzzy thresholds. Notification code (Phase 3)
 should therefore make a duplicate alert recognisable rather than assume rows are unique
 quakes.
+
+### Fixed-window rate limiting allows bursts at window edges
+
+The limiter counts requests per client per clock-aligned minute: one Redis `INCR` plus an
+`EXPIRE` per request, a single key per client, and nothing to clean up. The cost is that the
+window boundary is visible. A client can spend its whole allowance in the last second of one
+window and again in the first second of the next, so up to **2 × `RATE_LIMIT_PER_MINUTE`
+requests can land within about one second**. The average over any longer period still stays
+at the limit.
+
+That is acceptable here. The limit exists to keep one client from monopolising a small
+read-only API, and every endpoint is served from cache or by indexed queries, so a short
+2× burst is cheap. If exact smoothing ever matters (e.g. for an expensive endpoint), a
+sliding-window log (a sorted set per client) or a token bucket (a small Lua script) removes
+the edge burst. Both cost more Redis work per request.
+
+### Redis is an optimisation, never a dependency
+
+Redis holds only things the API can live without: cached responses and rate-limit
+counters. Every Redis failure degrades instead of erroring: the cache is bypassed and the
+rate limit fails open. The circuit breaker covers the slow failure mode as well. A Redis
+that accepts connections but never answers would otherwise add a timeout to every request,
+and after a few failures the breaker stops calling it at all. Failing open on rate limiting
+during a Redis outage is a deliberate choice: availability of quake data matters more
+than enforcing a per-client quota for a few minutes.
 
 ## Development
 

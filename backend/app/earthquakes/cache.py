@@ -1,5 +1,9 @@
 """Redis cache for the query API. Every operation degrades to "no cache" if Redis fails:
-the API must keep answering from the database when Redis is down."""
+the API must keep answering from the database when Redis is down.
+
+Reads and writes go through the API's circuit breaker (GuardedRedis). While the circuit is
+open they skip Redis silently; the breaker logs its own state changes once.
+"""
 
 import hashlib
 import json
@@ -9,6 +13,9 @@ from typing import Any
 
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
+
+from app.core.circuit_breaker import CircuitOpenError
+from app.core.redis import GuardedRedis
 
 logger = logging.getLogger(__name__)
 
@@ -28,24 +35,29 @@ def list_key(normalized_params: dict[str, Any]) -> str:
     return LIST_KEY_PREFIX + hashlib.sha256(canonical.encode()).hexdigest()
 
 
-async def read(redis: Redis, key: str) -> tuple[str | None, CacheStatus]:
+async def read(redis: GuardedRedis, key: str) -> tuple[str | None, CacheStatus]:
     try:
-        value: str | None = await redis.get(key)
+        value: str | None = await redis.run(lambda r: r.get(key))
+    except CircuitOpenError:
+        return None, CacheStatus.BYPASS
     except (RedisError, OSError) as exc:
         logger.warning("cache read failed", extra={"key": key, "error": repr(exc)})
         return None, CacheStatus.BYPASS
     return value, CacheStatus.HIT if value is not None else CacheStatus.MISS
 
 
-async def write(redis: Redis, key: str, value: str, ttl_seconds: int) -> None:
+async def write(redis: GuardedRedis, key: str, value: str, ttl_seconds: int) -> None:
     try:
-        await redis.set(key, value, ex=ttl_seconds)
+        await redis.run(lambda r: r.set(key, value, ex=ttl_seconds))
+    except CircuitOpenError:
+        return
     except (RedisError, OSError) as exc:
         logger.warning("cache write failed", extra={"key": key, "error": repr(exc)})
 
 
 async def invalidate_latest(redis: Redis) -> None:
-    """Called by ingestion after it inserts or updates a row."""
+    """Called by ingestion (the worker, with its own connection; no API breaker) after it
+    inserts or updates a row."""
     try:
         await redis.delete(LATEST_KEY)
     except (RedisError, OSError) as exc:
