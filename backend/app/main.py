@@ -4,13 +4,15 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.api import earthquakes, health, status, telegram
+from app.api import earthquakes, health, status, subscriptions, telegram
 from app.core.circuit_breaker import CircuitBreaker
 from app.core.config import Settings, get_settings
+from app.core.crypto import check_startup_secrets
 from app.core.logging import configure_logging
 from app.core.rate_limit import RateLimiter
 from app.core.redis import GuardedRedis, create_redis
 from app.db.session import create_engine, create_sessionmaker
+from app.notifications.webhook import WebhookNotifier, create_webhook_http_client
 
 
 def create_app(
@@ -23,6 +25,7 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         configure_logging(app_settings.log_level)
+        check_startup_secrets(app_settings)  # e.g. no WEBHOOK_SECRET_KEYS in production
         engine = create_engine(app_settings)
         redis = create_redis(app_settings.redis_url, app_settings.redis_socket_timeout_seconds)
         app.state.settings = app_settings
@@ -43,9 +46,18 @@ def create_app(
         app.state.rate_limiter = RateLimiter(
             guarded_redis, limit=app_settings.rate_limit_per_minute
         )
+        app.state.subscription_write_limiter = RateLimiter(
+            guarded_redis,
+            limit=app_settings.subscription_write_rate_limit_per_hour,
+            window_seconds=3600,
+            name="subscription-write",
+        )
+        webhook_http = create_webhook_http_client()
+        app.state.webhook_notifier = WebhookNotifier.from_settings(webhook_http, app_settings)
         try:
             yield
         finally:
+            await webhook_http.aclose()
             await redis.aclose()
             await engine.dispose()
 
@@ -54,6 +66,7 @@ def create_app(
     app.include_router(earthquakes.router)
     app.include_router(status.router)
     app.include_router(telegram.router)
+    app.include_router(subscriptions.router)
     return app
 
 

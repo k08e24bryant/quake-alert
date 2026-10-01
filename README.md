@@ -371,6 +371,94 @@ Catatan: mungkin kejadian yang sama dengan info gempa sebelumnya (01 Okt 2026 13
   its row from being matched again. That can't happen in practice: a row is only matched
   while its quake is at most `NOTIFY_MAX_AGE_MINUTES` old.
 
+## Notifications (webhooks)
+
+A webhook subscription gets a signed JSON `POST` for every matching quake. The full
+receiver guide (payload, headers, verifying signatures, retries, trying it by hand) is in
+**[docs/webhooks.md](docs/webhooks.md)**.
+
+| Endpoint | Does |
+|---|---|
+| `POST /v1/subscriptions/webhook` | Subscribes `url` near `lat`/`lon` (`radius_km` 10–1000, `min_magnitude` 2.0–9.0). Returns `signing_secret` and `manage_token` **once**. |
+| `DELETE /v1/subscriptions/webhook/{id}` | Hard-deletes it and its delivery history. Needs `Authorization: Bearer <manage_token>`. |
+| `POST /v1/subscriptions/webhook/{id}/test` | Sends one signed `webhook.test` payload (no quake data) now and reports the answer. Needs the token. |
+
+**One pipeline for both channels.** Telegram and webhooks implement one `Notifier`
+interface (`app/notifications/base.py`). Everything else is shared, in
+`app/notifications/dispatcher.py`:
+- the `needs_matching` outbox and SQL matching;
+- one delivery per (subscription, quake row);
+- the `NOTIFY_MAX_AGE_MINUTES` check before every attempt and retry;
+- retries with backoff, and retention.
+
+A notifier only turns an alert into one send attempt, and reports one of: sent, retry,
+recipient gone (deactivate), or permanent failure.
+
+**Webhook specifics:**
+- Coordinates are rounded to 2 decimals, as for Telegram.
+- The signature is `X-Quake-Signature: sha256=HMAC(secret, f"{timestamp}.{body}")`, with
+  `X-Quake-Timestamp` and `X-Quake-Delivery-Id`, which stays the same on retries.
+- Status codes:
+  - `2xx` is sent.
+  - `410` deactivates the subscription.
+  - Other `4xx` and `3xx` fail without retry. Redirects are never followed.
+  - `5xx`, timeouts and DNS failures retry: 5 attempts with exponential backoff.
+- After `WEBHOOK_MAX_CONSECUTIVE_FAILURES` (10) failed deliveries in a row, the
+  subscription is deactivated, and this is logged once.
+- Synthetic quakes are sent as `event: earthquake.test` with `synthetic: true`. The
+  pipeline refuses to send any synthetic quake unless `ENVIRONMENT=development`.
+
+**SSRF protection, with no bypass in any environment:**
+- `https` only (`http` only in development).
+- The host is resolved at send time, and every address must be public. Loopback, private,
+  link-local, cloud metadata, carrier-grade NAT, multicast, reserved, and IPv4 embedded in
+  IPv6 are all refused.
+- The request connects to the vetted IP with the original Host and SNI.
+- No redirects, no environment proxy, no pooled connections.
+- 5 s timeouts, and at most 64 KB of the response is read.
+
+Creating subscriptions and sending test payloads share a stricter limit of
+`SUBSCRIPTION_WRITE_RATE_LIMIT_PER_HOUR` (5) per IP, on top of the general one.
+
+### Signing secrets and key rotation
+
+A signing secret must be readable to sign, so it is stored **encrypted**, not hashed:
+Fernet with `MultiFernet` over `WEBHOOK_SECRET_KEYS` (comma-separated). The manage token
+is only ever compared, so it is stored as a sha256 hash.
+
+- The **first** key encrypts. **Any** listed key decrypts.
+- **The API and the worker refuse to start in production without a key**, and refuse to
+  start anywhere with a malformed key.
+- Generate a key:
+  `uv run python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`
+
+**Rotating a key:**
+1. Put the new key **first**, keep the old ones after it, and restart the API and the
+   worker. New subscriptions are encrypted with the new key, and existing ones still
+   decrypt with the old one.
+2. An old key may only be removed once no stored secret needs it. Re-encrypting stored
+   secrets (`SecretBox.rotate`) has no command yet (see Out of scope). Until then, keep
+   old keys listed.
+
+If a secret's key is removed anyway, its deliveries fail with "signing secret cannot be
+decrypted"; nothing is ever sent unsigned. After 10 such failures the subscription is
+deactivated.
+
+### Webhooks: out of scope / known gaps
+
+- **No re-encryption command** for key rotation (see above).
+- **No reactivation.** A subscription deactivated by `410` or by consecutive failures stays
+  inactive. Delete it and create a new one.
+- **A lost manage token can't be recovered**, because only its hash is stored. Subscribe
+  again; the old subscription stops on its own after 10 failed deliveries, or is
+  deactivated by a `410`.
+- **`429` from a receiver is not retried**, as specified ("other 4xx: no retry"), and its
+  `Retry-After` is ignored.
+- **The hourly write limit fails open** while Redis is down, like every API rate limit.
+- **No proof of URL ownership.** Anyone can point a subscription at any public HTTPS URL.
+  The hourly limit, the public-address rule and auto-deactivation bound the damage. A
+  verification handshake (echoing a challenge) would close it.
+
 ## Design decisions
 
 ### Dedup prefers duplicates over wrong merges
@@ -430,6 +518,47 @@ So staleness is reported as information:
 
 The history (what the API serves) stays correct while stale; it is just incomplete at the
 recent end.
+
+### A wrong manage token answers 404, not 403
+
+`DELETE` and `POST .../test` answer the same `404 Subscription not found.` in all of these
+cases:
+- the id doesn't exist;
+- the token is missing or wrong;
+- the id belongs to a Telegram subscription.
+
+A 403 for a wrong token, next to a 404 for an unknown id, would tell anyone which ids
+exist. That is an oracle for probing subscriptions, and each subscription reveals someone's
+approximate location. With one answer, the only way to learn anything is to hold the
+token.
+
+The lookup also does the same work either way: it hashes the presented token and compares
+in constant time even when there is no row to compare against. The manage token is 256
+random bits, so a fast sha256 is enough: it can't be brute-forced, and a slow password hash
+would add nothing.
+
+### Webhooks connect to the IP that was checked
+
+The obvious SSRF check is broken. Resolving the name, checking the address, and then
+handing the URL to the HTTP client makes the client resolve the name **again**.
+
+A hostile DNS server can answer the first lookup with a public address and the second
+with `127.0.0.1` or `169.254.169.254`. This is DNS rebinding, and the check never sees the
+address actually used.
+
+So the worker resolves once, rejects the request if **any** answer is non-public, and then
+sends the request to that exact IP (`https://93.184.216.34/...`). It sets `Host:` and the
+TLS SNI to the subscriber's hostname, so virtual hosting works and the certificate is
+still verified for that hostname.
+
+Three related measures:
+- **No redirects.** A `Location` header would be a second, unchecked target.
+- **No environment proxy.** A proxy would do its own resolution.
+- **No connection pooling.** The pool is keyed by IP, so a pooled connection could carry
+  one hostname's request over another hostname's TLS session.
+
+The check runs again before every send, not only at subscription time, because DNS can
+change at any moment.
 
 ### Fixed-window rate limiting allows bursts at window edges
 
@@ -523,6 +652,11 @@ docker compose up --build
     `REDIS_SOCKET_TIMEOUT_SECONDS` timeout, so a hung Redis can't stall the probe.
 - `GET /v1/status`: ingestion freshness. It is information, not a readiness signal (see
   [Design decisions](#staleness-is-exposed-not-a-readiness-failure)).
+
+Webhook subscriptions need `WEBHOOK_SECRET_KEYS` in `backend/.env` (see
+[Signing secrets and key rotation](#signing-secrets-and-key-rotation)). Without it,
+`POST /v1/subscriptions/webhook` answers 503. To watch a real delivery, see "Trying it by
+hand" in [docs/webhooks.md](docs/webhooks.md).
 
 To try the bot locally, create a bot with @BotFather and put its token in `backend/.env` as
 `TELEGRAM_BOT_TOKEN`. The worker uses it to send alerts. Then run the polling script (see

@@ -78,6 +78,20 @@ class Settings(BaseSettings):
     # alert may be the same event reported by another BMKG feed (dedup keeps such duplicates).
     notify_duplicate_window_seconds: int = Field(default=120, ge=0)
     notify_duplicate_distance_km: float = Field(default=100.0, ge=0)
+    # Webhook channel. Signing secrets are stored encrypted with these Fernet keys
+    # (comma-separated): encrypt with the first, decrypt with any, so keys can be rotated.
+    # Required in production: the API and the worker refuse to start without one.
+    webhook_secret_keys: SecretStr = SecretStr("")
+    # Connect, read, write and pool timeouts of one webhook POST.
+    webhook_timeout_seconds: float = Field(default=5.0, gt=0)
+    # At most this much of a receiver's response body is read (it is only kept for errors).
+    webhook_max_response_bytes: int = Field(default=65536, ge=0)
+    # A webhook subscription is deactivated after this many failed deliveries in a row.
+    webhook_max_consecutive_failures: int = Field(default=10, ge=1)
+    # Per client IP, on top of RATE_LIMIT_PER_MINUTE: POST /v1/subscriptions/webhook and
+    # POST /v1/subscriptions/webhook/{id}/test share this hourly budget.
+    subscription_write_rate_limit_per_hour: int = Field(default=5, ge=1)
+
     # Daily prune: sent/failed deliveries older than this are deleted; pending never are.
     notification_deliveries_retention_days: int = Field(default=30, ge=1)
 

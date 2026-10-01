@@ -84,3 +84,30 @@ async def seed_subscription(
     session.add(row)
     await session.flush()
     return row
+
+
+async def seed_webhook_subscription(
+    session: AsyncSession,
+    *,
+    url: str,
+    encrypted_secret: str,
+    at: tuple[float, float] = JAKARTA,
+    radius_km: int = 200,
+    min_magnitude: str = "4.0",
+    is_active: bool = True,
+    manage_token_hash: str = "0" * 64,
+) -> Subscription:
+    lat, lon = at
+    row = Subscription(
+        channel=SubscriptionChannel.WEBHOOK,
+        webhook_url=url,
+        webhook_secret_encrypted=encrypted_secret,
+        manage_token_hash=manage_token_hash,
+        location=WKTElement(f"POINT({lon} {lat})", srid=4326),
+        radius_km=radius_km,
+        min_magnitude=Decimal(min_magnitude),
+        is_active=is_active,
+    )
+    session.add(row)
+    await session.flush()
+    return row

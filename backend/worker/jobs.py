@@ -9,6 +9,7 @@ from arq import ArqRedis, Retry
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.core.config import Settings, get_settings
+from app.core.crypto import check_startup_secrets
 from app.db.session import create_engine, create_sessionmaker
 from app.earthquakes.cache import invalidate_latest
 from app.ingestion.bmkg_client import BmkgClient, create_http_client
@@ -19,12 +20,14 @@ from app.notifications.dispatcher import NotifyConfig, RetryDeliveryError, deliv
 from app.notifications.matcher import MatchResult, match_flagged, pending_delivery_ids
 from app.notifications.retention import prune_notification_deliveries
 from app.notifications.telegram import TelegramClient
+from app.notifications.webhook import WebhookNotifier, create_webhook_http_client
 
 logger = logging.getLogger(__name__)
 
 
 async def startup(ctx: dict[str, Any]) -> None:
     settings = get_settings()
+    check_startup_secrets(settings)  # e.g. no WEBHOOK_SECRET_KEYS in production
     engine = create_engine(settings)
     http = create_http_client(settings)
     ctx["settings"] = settings
@@ -33,12 +36,15 @@ async def startup(ctx: dict[str, Any]) -> None:
     ctx["http"] = http
     ctx["bmkg_client"] = BmkgClient.from_settings(http, settings)
     ctx["telegram"] = TelegramClient.from_settings(http, settings)
+    ctx["webhook_http"] = create_webhook_http_client()
+    ctx["webhook"] = WebhookNotifier.from_settings(ctx["webhook_http"], settings)
     ctx["notify_config"] = NotifyConfig.from_settings(settings)
     ctx["staleness_monitor"] = StalenessMonitor()
 
 
 async def shutdown(ctx: dict[str, Any]) -> None:
     await ctx["http"].aclose()
+    await ctx["webhook_http"].aclose()
     engine: AsyncEngine = ctx["engine"]
     await engine.dispose()
 
@@ -88,6 +94,7 @@ async def deliver_notification(ctx: dict[str, Any], delivery_id: str) -> str:
             attempt=ctx["job_try"],
             now=datetime.now(UTC),
             config=ctx["notify_config"],
+            webhook=ctx.get("webhook"),
         )
     except RetryDeliveryError as exc:
         raise Retry(defer=exc.defer_seconds) from exc

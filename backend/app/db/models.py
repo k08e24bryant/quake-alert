@@ -39,7 +39,7 @@ class IngestionStatus(StrEnum):
 
 class SubscriptionChannel(StrEnum):
     TELEGRAM = "telegram"
-    WEBHOOK = "webhook"  # in the data model; not offered yet
+    WEBHOOK = "webhook"
 
 
 class DeliveryStatus(StrEnum):
@@ -137,8 +137,13 @@ class Subscription(Base):
     # One subscription per Telegram chat: sharing a new location moves it.
     telegram_chat_id: Mapped[int | None] = mapped_column(BigInteger, unique=True)
     webhook_url: Mapped[str | None] = mapped_column(Text)
-    webhook_secret_hash: Mapped[str | None] = mapped_column(Text)
+    # The HMAC signing secret, Fernet-encrypted with WEBHOOK_SECRET_KEYS: it must be readable
+    # to sign, so it is encrypted, not hashed.
+    webhook_secret_encrypted: Mapped[str | None] = mapped_column(Text)
+    # sha256 of the manage token (a random 256-bit token, so a fast hash is enough).
     manage_token_hash: Mapped[str | None] = mapped_column(Text)
+    # Failed webhook deliveries in a row; reset by a success. Unused for Telegram.
+    consecutive_failures: Mapped[int] = mapped_column(Integer, server_default="0")
     # Rounded to 2 decimals (~1 km) before it is stored, for the subscriber's privacy.
     location: Mapped[WKBElement | WKTElement] = mapped_column(
         Geography(geometry_type="POINT", srid=4326, spatial_index=False)
@@ -153,6 +158,11 @@ class Subscription(Base):
         CheckConstraint("radius_km > 0", name="radius_km_positive"),
         CheckConstraint(
             "channel <> 'telegram' OR telegram_chat_id IS NOT NULL", name="telegram_chat_id"
+        ),
+        CheckConstraint(
+            "channel <> 'webhook' OR (webhook_url IS NOT NULL"
+            " AND webhook_secret_encrypted IS NOT NULL AND manage_token_hash IS NOT NULL)",
+            name="webhook_fields",
         ),
     )
 

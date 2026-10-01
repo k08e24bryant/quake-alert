@@ -160,6 +160,8 @@ def app_settings(database_url: URL, integration_settings: IntegrationSettings) -
         database_url=database_url.render_as_string(hide_password=False),
         redis_url=integration_settings.test_redis_url,
         telegram_webhook_secret=SecretStr(telegram_samples.WEBHOOK_SECRET),
+        # Explicit, so a key in a developer's backend/.env can't change test behaviour.
+        webhook_secret_keys=SecretStr(""),
     )
 
 

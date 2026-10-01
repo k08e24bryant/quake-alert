@@ -49,9 +49,12 @@ class RateLimiter:
         *,
         limit: int,
         window_seconds: int = 60,
+        name: str = "",
         clock: Callable[[], float] = time.time,
     ) -> None:
         self._redis = redis
+        # Separate limiters (e.g. the hourly one for subscription writes) need their own keys.
+        self._prefix = f"{KEY_PREFIX}{name}:" if name else KEY_PREFIX
         self._limit = limit
         self._window = window_seconds
         self._clock = clock
@@ -60,7 +63,7 @@ class RateLimiter:
         """Count one request from `client`. None means Redis failed: let it through."""
         now = self._clock()
         window = int(now // self._window)
-        key = f"{KEY_PREFIX}{client}:{window}"
+        key = f"{self._prefix}{client}:{window}"
 
         async def count_hit(redis: Redis) -> int:
             async with redis.pipeline(transaction=True) as pipe:
@@ -100,7 +103,16 @@ def client_ip(request: Request, trust_proxy_headers: bool) -> str:
 
 async def enforce_rate_limit(request: Request, response: Response) -> None:
     """FastAPI dependency for /v1 routes: sets X-RateLimit-* headers, raises 429 when over."""
-    limiter: RateLimiter = request.app.state.rate_limiter
+    await _enforce(request.app.state.rate_limiter, request, response)
+
+
+async def enforce_subscription_write_limit(request: Request, response: Response) -> None:
+    """The stricter hourly limit for creating webhook subscriptions and sending test
+    payloads, applied on top of enforce_rate_limit. Its headers replace the general ones."""
+    await _enforce(request.app.state.subscription_write_limiter, request, response)
+
+
+async def _enforce(limiter: "RateLimiter", request: Request, response: Response) -> None:
     trust: bool = request.app.state.settings.trust_proxy_headers
     decision = await limiter.hit(client_ip(request, trust))
     if decision is None:

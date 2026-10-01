@@ -10,6 +10,14 @@ from typing import Any
 import httpx
 
 from app.core.config import Settings
+from app.notifications.base import (
+    AlertData,
+    PermanentNotifierError,
+    Recipient,
+    RecipientGoneError,
+    RetryableNotifierError,
+)
+from app.notifications.messages import Alert, render_alert
 
 
 class TelegramError(Exception):
@@ -119,3 +127,37 @@ class TelegramClient:
         if status >= 500 or status == 200:  # 200 with ok=false or a non-JSON body
             raise TelegramUnavailableError(description, status_code=status)
         raise TelegramRequestError(description, status_code=status)
+
+
+class TelegramNotifier:
+    """The Telegram channel behind the common Notifier interface."""
+
+    def __init__(self, client: TelegramClient) -> None:
+        self._client = client
+
+    async def send(self, recipient: Recipient, alert: AlertData) -> None:
+        if recipient.telegram_chat_id is None:
+            raise PermanentNotifierError("subscription has no Telegram chat")
+        text = render_alert(
+            Alert(
+                magnitude=alert.magnitude,
+                region=alert.region,
+                depth_km=alert.depth_km,
+                occurred_at=alert.occurred_at,
+                distance_km=alert.distance_km,
+                potential=alert.potential,
+                shakemap_url=alert.shakemap_url,
+                possible_duplicate_of=alert.possible_duplicate_of,
+                is_test=alert.is_synthetic,
+            )
+        )
+        try:
+            await self._client.send_message(recipient.telegram_chat_id, text)
+        except TelegramRetryAfterError as exc:
+            raise RetryableNotifierError(exc.description, retry_after=exc.retry_after) from exc
+        except TelegramUnavailableError as exc:
+            raise RetryableNotifierError(exc.description) from exc
+        except TelegramForbiddenError as exc:  # the user blocked the bot
+            raise RecipientGoneError(exc.description) from exc
+        except TelegramError as exc:
+            raise PermanentNotifierError(exc.description) from exc
