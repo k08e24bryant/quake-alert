@@ -29,6 +29,11 @@ class Settings(BaseSettings):
     dedup_max_time_diff_seconds: int = Field(default=60, ge=0)
     dedup_max_distance_km: float = Field(default=50.0, ge=0)
 
+    # Retention for ingestion_runs. The latest successful run per feed is always kept,
+    # because the content-hash skip compares against it.
+    ingestion_runs_retention_days: int = Field(default=14, ge=1)  # success and skipped runs
+    ingestion_runs_failed_retention_days: int = Field(default=90, ge=1)
+
 
 @lru_cache
 def get_settings() -> Settings:

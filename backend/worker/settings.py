@@ -6,7 +6,7 @@ from arq.typing import WorkerCoroutine
 
 from app.core.config import Settings, get_settings
 from app.core.logging import logging_config
-from worker.jobs import poll_bmkg_feeds, shutdown, startup
+from worker.jobs import poll_bmkg_feeds, prune_old_ingestion_runs, shutdown, startup
 
 _settings: Settings = get_settings()
 
@@ -25,7 +25,14 @@ class WorkerSettings:
             unique=True,  # never overlap with a slow previous poll
             timeout=55,
             max_tries=1,  # the next minute is the retry
-        )
+        ),
+        cron(
+            prune_old_ingestion_runs,
+            hour=3,  # daily at 03:00 UTC
+            minute=0,
+            unique=True,
+            timeout=300,
+        ),
     ]
     redis_settings = RedisSettings.from_dsn(_settings.redis_url)
     on_startup = startup

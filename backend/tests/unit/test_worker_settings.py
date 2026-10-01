@@ -4,12 +4,12 @@ import httpx
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.ingestion.bmkg_client import BmkgClient
-from worker.jobs import poll_bmkg_feeds, shutdown, startup
+from worker.jobs import poll_bmkg_feeds, prune_old_ingestion_runs, shutdown, startup
 from worker.settings import WorkerSettings
 
 
 def test_bmkg_poll_is_a_unique_cron_job_every_minute() -> None:
-    [job] = WorkerSettings.cron_jobs
+    [job] = [j for j in WorkerSettings.cron_jobs if j.coroutine is poll_bmkg_feeds]
 
     assert job.coroutine is poll_bmkg_feeds
     assert job.second == 0
@@ -17,6 +17,14 @@ def test_bmkg_poll_is_a_unique_cron_job_every_minute() -> None:
     assert job.unique is True
     assert job.run_at_startup is True
     assert job.timeout_s is not None and job.timeout_s < 60
+
+
+def test_ingestion_run_retention_runs_daily() -> None:
+    [job] = [j for j in WorkerSettings.cron_jobs if j.coroutine is prune_old_ingestion_runs]
+
+    assert (job.hour, job.minute, job.second) == (3, 0, 0)
+    assert job.unique is True
+    assert job.run_at_startup is False
 
 
 async def test_startup_builds_and_shutdown_closes_the_job_context() -> None:
