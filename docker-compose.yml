@@ -3,6 +3,9 @@
 
 x-backend: &backend
   build: ./backend
+  # The arq worker exits when it loses Redis; restarting is how it resumes once Redis is
+  # back (Docker backs off between attempts, up to about a minute).
+  restart: unless-stopped
   env_file:
     - path: ./backend/.env
       required: false

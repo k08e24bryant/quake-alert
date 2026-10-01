@@ -192,6 +192,30 @@ async def test_breaker_recovers_after_the_open_period(
     assert cached.headers["X-Cache"] == "HIT"
 
 
+async def test_readyz_with_hung_redis_is_ready_degraded_and_fast(api: AsyncClient) -> None:
+    started = time.perf_counter()
+    response = await api.get("/readyz")
+    elapsed = time.perf_counter() - started
+
+    assert response.status_code == 200
+    assert response.json() == {"db": "ok", "redis": "degraded"}
+    assert elapsed < TIMEOUT_SECONDS + 0.3  # bounded by the short Redis timeout
+
+
+async def test_readyz_probes_redis_directly_even_while_the_breaker_is_open(
+    api: AsyncClient, breaker_app: FastAPI, proxy: RedisProxy
+) -> None:
+    await open_the_circuit(api, breaker_app)
+    proxy.hang = False  # Redis is back, but the breaker hasn't noticed yet
+    before = proxy.touches
+
+    response = await api.get("/readyz")
+
+    assert response.json() == {"db": "ok", "redis": "ok"}  # the truth, not the breaker's view
+    assert proxy.touches != before
+    assert state(breaker_app) is BreakerState.OPEN  # readyz doesn't feed the breaker
+
+
 async def test_half_open_failure_reopens_the_breaker(
     api: AsyncClient, breaker_app: FastAPI, proxy: RedisProxy, clock: FakeClock
 ) -> None:

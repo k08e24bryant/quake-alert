@@ -114,11 +114,13 @@ async def test_redis_down_serves_from_the_database(
     assert "X-RateLimit-Limit" not in listed.headers
 
 
-async def test_redis_down_is_reported_by_readyz_but_not_healthz(
+async def test_redis_down_keeps_the_api_ready_but_degraded(
     api_without_redis: AsyncClient,
 ) -> None:
     assert (await api_without_redis.get("/healthz")).status_code == 200
-    assert (await api_without_redis.get("/readyz")).status_code == 503
+    ready = await api_without_redis.get("/readyz")
+    assert ready.status_code == 200
+    assert ready.json() == {"db": "ok", "redis": "degraded"}
 
 
 # --- rate limiting ------------------------------------------------------------------------

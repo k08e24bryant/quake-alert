@@ -124,7 +124,7 @@ shift or repeat later pages.
   timezone offsets of the same instant all share one entry.
 - The `X-Cache` header is `HIT`, `MISS` or `BYPASS`.
 - **If Redis is down**, the API answers from the database (`X-Cache: BYPASS`) and rate
-  limiting is skipped. `/readyz` reports Redis as failing, but requests keep succeeding.
+  limiting is skipped. `/readyz` stays 200 and reports `"redis": "degraded"`.
   Redis calls time out after `REDIS_SOCKET_TIMEOUT_SECONDS` (0.5).
 - **Circuit breaker:** all request-path Redis calls (cache and rate limit) go through an
   in-process breaker (`app/core/circuit_breaker.py`).
@@ -135,6 +135,9 @@ shift or repeat later pages.
     breaker, failure reopens it for another full period.
   - Only state changes are logged.
   - `/readyz` bypasses the breaker on purpose: it has to probe Redis for real.
+  - Breaker state is **per process**. With several uvicorn workers or API replicas, each
+    one opens and recovers on its own, so a hung Redis costs up to *threshold* timeouts
+    per process rather than in total. Nothing is shared or coordinated between them.
 
 **Rate limiting** applies to `/v1/*` only, per client IP, with a fixed window of
 `RATE_LIMIT_PER_MINUTE` (60) requests per minute.
@@ -220,15 +223,48 @@ read-only API, and every endpoint is served from cache or by indexed queries, so
 sliding-window log (a sorted set per client) or a token bucket (a small Lua script) removes
 the edge burst. Both cost more Redis work per request.
 
-### Redis is an optimisation, never a dependency
+### For the API, Redis is an optimisation; the worker needs it
 
-Redis holds only things the API can live without: cached responses and rate-limit
-counters. Every Redis failure degrades instead of erroring: the cache is bypassed and the
-rate limit fails open. The circuit breaker covers the slow failure mode as well. A Redis
-that accepts connections but never answers would otherwise add a timeout to every request,
-and after a few failures the breaker stops calling it at all. Failing open on rate limiting
-during a Redis outage is a deliberate choice: availability of quake data matters more
-than enforcing a per-client quota for a few minutes.
+**API.** Redis holds only things the API can live without: cached responses and rate-limit
+counters. Every Redis failure degrades instead of erroring: the cache is bypassed, the rate
+limit fails open, and `/readyz` stays 200 with `"redis": "degraded"`. The circuit breaker
+covers the slow failure mode as well. A Redis that accepts connections but never answers
+would otherwise add a timeout to every request, and after a few failures the breaker stops
+calling it at all. Failing open on rate limiting during a Redis outage is a deliberate
+choice: availability of quake data matters more than enforcing a per-client quota for a few
+minutes.
+
+**Worker.** The worker is different: arq *is* Redis. Its cron schedule, job queue and
+retries all live there, so **while Redis is down, ingestion stops**. Notifications
+(Phase 3) will run as arq jobs as well and will stop too. Specifically:
+
+- The worker process exits when it loses Redis. Docker Compose restarts it
+  (`restart: unless-stopped`) until Redis is reachable again. Docker backs off between
+  restart attempts, so the worker can resume up to about a minute after Redis does.
+  Verified locally: with Redis stopped, the worker exited and was restarted. Once Redis was
+  back, the worker started and polled BMKG within about a second, because the poll job has
+  `run_at_startup`.
+- Missed minutes are not replayed. The first poll after recovery reads the feeds as they
+  are now.
+
+What recovery does **not** cause:
+
+- **No double processing.** The content-hash skip compares against the last successful run
+  stored in **PostgreSQL**, not Redis, so it survives the outage: unchanged feeds are
+  skipped. Changed feeds go through dedup, which is idempotent. Re-reading a quake already
+  stored is `UNCHANGED`, never a second row.
+- **No stale alerts** (Phase 3 design, per `NOTIFY_MAX_AGE_MINUTES`). Alerts are sent only
+  for quakes whose `occurred_at` is within the freshness window (default 30 min). A quake
+  first ingested after a long outage is stored for the history and the API, but not pushed
+  to subscribers as if it were new.
+
+What an outage **can** cost:
+
+- **Late or missing quakes.** BMKG has no history endpoint (`gempaterkini` and
+  `gempadirasakan` hold the latest 15 each, `autogempa` only one), so a quake that rotates
+  out of every feed during a long outage is never seen.
+- **Missed alerts.** A quake older than the freshness window by the time the worker
+  resumes produces no alert.
 
 ## Development
 
@@ -250,8 +286,13 @@ docker compose up --build
 | `worker` | arq worker (`worker.settings.WorkerSettings`)                     |
 
 - `GET /healthz`: liveness. The process is up; no dependencies are checked.
-- `GET /readyz`: readiness. 200 when PostgreSQL and Redis are reachable, 503 with the
-  failing check(s) otherwise.
+- `GET /readyz`: readiness, for load balancers and orchestrators.
+  - 200 when PostgreSQL is reachable, even if Redis is down: the API can still serve
+    everything from the database.
+  - 503 only when the database check fails.
+  - The body reports each component: `{"db": "ok" | "error", "redis": "ok" | "degraded"}`.
+  - Redis is probed directly, not through the circuit breaker, with the short
+    `REDIS_SOCKET_TIMEOUT_SECONDS` timeout, so a hung Redis can't stall the probe.
 
 If ports 5432/6379/8000 are taken on your machine, set `POSTGRES_PORT`, `REDIS_PORT` or
 `API_PORT` in the root `.env`, and update the URLs in `backend/.env` to match.

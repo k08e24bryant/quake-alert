@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     redis_breaker_failure_threshold: int = Field(default=3, ge=1)
     redis_breaker_open_seconds: float = Field(default=30.0, gt=0)
 
+    # /readyz database check. (Its Redis check uses redis_socket_timeout_seconds.)
     readiness_timeout_seconds: float = 2.0
 
     bmkg_base_url: str = "https://data.bmkg.go.id/DataMKG/TEWS/"

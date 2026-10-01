@@ -32,11 +32,8 @@ async def test_healthz_does_not_depend_on_database_or_redis(client: AsyncClient)
     assert response.json() == {"status": "ok"}
 
 
-async def test_readyz_returns_503_when_dependencies_are_unreachable(client: AsyncClient) -> None:
+async def test_readyz_is_503_when_the_database_is_unreachable(client: AsyncClient) -> None:
     response = await client.get("/readyz")
 
     assert response.status_code == 503
-    assert response.json() == {
-        "status": "error",
-        "checks": {"database": "error", "redis": "error"},
-    }
+    assert response.json() == {"db": "error", "redis": "degraded"}
