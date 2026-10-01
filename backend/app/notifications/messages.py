@@ -3,7 +3,7 @@
 Wording rules (CLAUDE.md, safety & legal): calm and factual, no emoji, never "peringatan
 dini" (this is not an early-warning system), BMKG's Potensi text verbatim under the label
 "Potensi (BMKG)" and never presented as tsunami information, and every alert ends with
-"Sumber: BMKG". Times in WIB, as BMKG publishes them.
+"Sumber: BMKG" and a link to bmkg.go.id. Times in WIB, as BMKG publishes them.
 """
 
 from dataclasses import dataclass
@@ -31,6 +31,9 @@ DISCLAIMER = (
     "atau tidak terkirim. Untuk informasi resmi dan arahan keselamatan, ikuti BMKG "
     "(bmkg.go.id / aplikasi InfoBMKG) dan BPBD setempat."
 )
+
+# Last line of every alert: attribution with a link (CLAUDE.md, safety & legal).
+SOURCE_LINE = "Sumber: BMKG (https://www.bmkg.go.id)"
 
 # First line of every alert about a synthetic quake (scripts/dev_fake_quake.py).
 TEST_PREFIX = "[TES - BUKAN GEMPA NYATA]"
@@ -146,5 +149,5 @@ def render_alert(alert: Alert) -> str:
         lines.append(f"Potensi (BMKG): {alert.potential}")
     if alert.shakemap_url:
         lines.append(f"Peta guncangan (shakemap): {alert.shakemap_url}")
-    lines.append("Sumber: BMKG")
+    lines.append(SOURCE_LINE)
     return "\n".join(lines)

@@ -40,7 +40,9 @@ Each poll works like this:
 2. **Skip unchanged feeds.** If the sha256 of a feed's canonical JSON equals the hash of
    that feed's last *successful* run, the feed isn't processed again.
 3. **Parse** into typed `QuakeReport`s (`app/ingestion/parser.py`):
-   - string numbers (`"5.2"`, `"10 km"`) become numbers;
+   - string numbers (`"5.2"`, `"10 km"`) become numbers, exactly: BMKG's values are relayed
+     as-is, so a value that can't be stored without rounding (e.g. magnitude `"5.25"` or
+     depth `"10.5 km"`) makes the item malformed instead of being rounded;
    - `"lat,lon"` becomes coordinates;
    - time comes from the UTC `DateTime` field, never the local `Tanggal`/`Jam`;
    - a malformed item is logged, skipped and counted in the run's `skipped_count`.
@@ -94,7 +96,8 @@ because stored payloads are re-parsed on every merge.
 ## Query API
 
 Interactive docs are at `/docs` (OpenAPI at `/openapi.json`). Every response includes a
-`source` object attributing the data to BMKG, with `data_as_of` (see
+`source` object attributing the data to BMKG (`"notice": "Sumber: BMKG"`, `url`
+`https://data.bmkg.go.id/`), with `data_as_of` (see
 [Ingestion freshness](#ingestion-freshness)).
 
 | Endpoint | Returns |
@@ -337,7 +340,7 @@ Kedalaman: 25 km
 Jarak dari lokasi Anda: sekitar 120 km
 Potensi (BMKG): Tidak berpotensi tsunami
 Peta guncangan (shakemap): https://data.bmkg.go.id/DataMKG/TEWS/20261001132452.mmi.jpg
-Sumber: BMKG
+Sumber: BMKG (https://www.bmkg.go.id)
 ```
 
 - The time is in WIB (UTC+7, no daylight saving), as BMKG publishes it.

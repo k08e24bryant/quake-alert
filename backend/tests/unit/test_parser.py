@@ -142,12 +142,14 @@ def test_invalid_coordinates_are_rejected(value: str) -> None:
         parse_coordinates(value)
 
 
-@pytest.mark.parametrize(("value", "expected"), [("5.2", "5.2"), (" 4 ", "4.0"), ("3.25", "3.2")])
+@pytest.mark.parametrize(("value", "expected"), [("5.2", "5.2"), (" 4 ", "4.0"), ("5.20", "5.2")])
 def test_magnitude_is_a_one_decimal_number(value: str, expected: str) -> None:
     assert parse_magnitude(value) == Decimal(expected)
 
 
-@pytest.mark.parametrize("value", ["", "M5.2", "-1", "10.0"])
+# "3.25" would have to be rounded to fit numeric(3,1): rejected (the item is skipped and
+# logged), because BMKG's numbers are relayed as-is, never modified.
+@pytest.mark.parametrize("value", ["", "M5.2", "-1", "10.0", "3.25", "5.21"])
 def test_invalid_magnitude_is_rejected(value: str) -> None:
     with pytest.raises(BmkgParseError):
         parse_magnitude(value)

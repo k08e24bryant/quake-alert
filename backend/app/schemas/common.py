@@ -15,7 +15,7 @@ class SourceAttribution(BaseModel):
 
     name: str = "BMKG (Badan Meteorologi, Klimatologi, dan Geofisika)"
     url: str = "https://data.bmkg.go.id/"
-    notice: str = "Earthquake data from BMKG Open Data."
+    notice: str = "Sumber: BMKG"
     data_as_of: UtcDatetime | None = Field(
         default=None,
         description=(

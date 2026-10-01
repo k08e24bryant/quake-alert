@@ -14,7 +14,7 @@ from tests.integration.seed import BANDUNG, BOGOR, JAKARTA, SURABAYA, seed_quake
 SOURCE = {
     "name": "BMKG (Badan Meteorologi, Klimatologi, dan Geofisika)",
     "url": "https://data.bmkg.go.id/",
-    "notice": "Earthquake data from BMKG Open Data.",
+    "notice": "Sumber: BMKG",
     "data_as_of": None,  # no ingestion_runs in these tests; see test_status.py
 }
 

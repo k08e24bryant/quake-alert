@@ -42,7 +42,7 @@ def test_alert_has_every_required_field() -> None:
         "Jarak dari lokasi Anda: sekitar 120 km",
         "Potensi (BMKG): Tidak berpotensi tsunami",
         "Peta guncangan (shakemap): https://data.bmkg.go.id/DataMKG/TEWS/20261001132452.mmi.jpg",
-        "Sumber: BMKG",
+        "Sumber: BMKG (https://www.bmkg.go.id)",
     ]
 
 
@@ -60,7 +60,7 @@ def test_optional_lines_are_omitted_when_bmkg_has_no_value() -> None:
 
     assert "Potensi" not in text
     assert "shakemap" not in text
-    assert text.endswith("Sumber: BMKG")
+    assert text.endswith("Sumber: BMKG (https://www.bmkg.go.id)")
 
 
 @pytest.mark.parametrize(

@@ -103,7 +103,11 @@ def parse_magnitude(value: str) -> Decimal:
     magnitude = _decimal(value, "Magnitude")
     if not 0 <= magnitude < 10:
         raise BmkgParseError(f"Magnitude {value!r} out of range")
-    return magnitude.quantize(_ONE_PLACE)
+    one_place = magnitude.quantize(_ONE_PLACE)
+    if one_place != magnitude:
+        # Never round BMKG's number (relay as-is): an item we can't store exactly is skipped.
+        raise BmkgParseError(f"Magnitude {value!r} has more than one decimal")
+    return one_place
 
 
 def parse_depth_km(value: str) -> int:

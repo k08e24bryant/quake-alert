@@ -106,7 +106,7 @@ async def test_sends_the_alert_and_records_it(
         "Jarak dari lokasi Anda: sekitar 43 km",  # Jakarta -> Bogor, by PostGIS
         "Potensi (BMKG): Tidak berpotensi tsunami",
         "WIB",
-        "Sumber: BMKG",
+        "Sumber: BMKG (https://www.bmkg.go.id)",
     ):
         assert expected in text
     assert not text.startswith("Catatan")
