@@ -1,0 +1,78 @@
+# Development stack: PostGIS, Redis, API (auto-reload), arq worker.
+# Usage: docker compose up --build   ->   http://localhost:8000/readyz
+
+x-backend: &backend
+  build: ./backend
+  env_file:
+    - path: ./backend/.env
+      required: false
+  environment: &backend-env
+    # Point at the compose services; these override anything in backend/.env.
+    DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-quake}:${POSTGRES_PASSWORD:-quake}@db:5432/${POSTGRES_DB:-quake_alert}
+    REDIS_URL: redis://redis:6379/0
+  volumes:
+    - ./backend/app:/app/app
+    - ./backend/worker:/app/worker
+    - ./backend/alembic:/app/alembic
+  depends_on:
+    db:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+services:
+  db:
+    image: postgis/postgis:16-3.5
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-quake}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-quake}
+      POSTGRES_DB: ${POSTGRES_DB:-quake_alert}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    <<: *backend
+    # Migrate, then serve. Polling is needed for reload to see edits made on a Windows/macOS host.
+    command: sh -c "alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir app"
+    environment:
+      <<: *backend-env
+      WATCHFILES_FORCE_POLLING: "true"
+    ports:
+      - "${API_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/readyz', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+
+  worker:
+    <<: *backend
+    command: arq worker.settings.WorkerSettings --custom-log-dict worker.settings.LOGGING_CONFIG
+    # The api service runs migrations; wait for it so jobs never see an unmigrated schema.
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  redisdata:
