@@ -42,8 +42,12 @@ def logging_config(level: str) -> dict[str, Any]:
         },
         "root": {"level": level, "handlers": ["stdout"]},
         "loggers": {
-            name: {"handlers": [], "propagate": True, "level": level}
-            for name in _THIRD_PARTY_LOGGERS
+            **{
+                name: {"handlers": [], "propagate": True, "level": level}
+                for name in _THIRD_PARTY_LOGGERS
+            },
+            # httpx logs every request at INFO; with a poll per feed per minute that is noise.
+            "httpx": {"level": "WARNING"},
         },
     }
 
