@@ -10,7 +10,7 @@ from app.db.models import IngestionRun, IngestionStatus
 from app.earthquakes.cache import LATEST_KEY
 from app.ingestion.domain import Feed
 from tests.bmkg_samples import BASE_URL, load
-from worker.jobs import poll_bmkg_feeds, prune_old_ingestion_runs
+from worker.jobs import poll_bmkg_feeds, prune_old_records
 
 
 async def test_poll_job_ingests_every_feed_and_records_runs(
@@ -59,7 +59,10 @@ async def test_prune_job_deletes_expired_runs_but_keeps_the_latest_success(
             for days in (30, 60)
         )
 
-    assert await prune_old_ingestion_runs(worker_ctx) == 3
+    assert await prune_old_records(worker_ctx) == {
+        "ingestion_runs": 3,
+        "notification_deliveries": 0,
+    }
 
     async with session_factory() as session:
         kept = (await session.scalars(select(IngestionRun.fetched_at))).all()

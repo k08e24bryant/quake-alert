@@ -29,6 +29,8 @@ async def seed_quake(
     potential: str | None = None,
     felt: str | None = None,
     feed: Feed = Feed.GEMPATERKINI,
+    needs_matching: bool = False,
+    is_synthetic: bool = False,
 ) -> Earthquake:
     lat, lon = at
     item = make_item(
@@ -53,6 +55,8 @@ async def seed_quake(
         source_feeds=[feed.value],
         fingerprint=uuid.uuid4().hex,  # rows here may deliberately share time and place
         raw={feed.value: item},
+        needs_matching=needs_matching,
+        is_synthetic=is_synthetic,
     )
     session.add(row)
     await session.flush()

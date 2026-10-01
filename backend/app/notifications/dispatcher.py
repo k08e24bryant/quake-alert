@@ -168,6 +168,7 @@ async def _load(
                 Earthquake.occurred_at,
                 Earthquake.potential,
                 Earthquake.shakemap_url,
+                Earthquake.is_synthetic,
                 (distance_m / 1000).label("distance_km"),
             )
             .join(Subscription, Subscription.id == NotificationDelivery.subscription_id)
@@ -191,6 +192,7 @@ async def _load(
         possible_duplicate_of=await _already_alerted_nearby(
             session, row.subscription_id, row.earthquake_id, config
         ),
+        is_test=row.is_synthetic,
     )
     return _Pending(row.subscription_id, row.telegram_chat_id, row.is_active, alert)
 
@@ -214,6 +216,8 @@ async def _already_alerted_nearby(
             NotificationDelivery.subscription_id == subscription_id,
             NotificationDelivery.status == DeliveryStatus.SENT,
             NotificationDelivery.earthquake_id != earthquake_id,
+            # A test quake is never "the same event" as a real one, either way round.
+            previous.is_synthetic == current.is_synthetic,
             previous.occurred_at.between(
                 current.occurred_at - config.duplicate_window,
                 current.occurred_at + config.duplicate_window,

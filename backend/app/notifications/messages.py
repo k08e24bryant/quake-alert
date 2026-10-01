@@ -25,12 +25,15 @@ from app.notifications.subscriptions import (
 WIB = timezone(timedelta(hours=7), "WIB")
 _MONTHS = ("Jan", "Feb", "Mar", "Apr", "Mei", "Jun", "Jul", "Agu", "Sep", "Okt", "Nov", "Des")
 
+# Verbatim from the project owner; also used in the README and the frontend footer.
 DISCLAIMER = (
-    "Penting: bot ini bukan layanan resmi dan tidak berafiliasi dengan BMKG. Info dikirim "
-    "otomatis dari data terbuka BMKG dan bisa terlambat, berubah, atau tidak terkirim. Jangan "
-    "jadikan bot ini satu-satunya sumber informasi keselamatan; ikuti informasi resmi BMKG "
-    "(www.bmkg.go.id, aplikasi InfoBMKG) dan arahan BPBD setempat."
+    "Layanan ini tidak resmi dan hanya meneruskan data dari BMKG. Notifikasi bisa terlambat "
+    "atau tidak terkirim. Untuk informasi resmi dan arahan keselamatan, ikuti BMKG "
+    "(bmkg.go.id / aplikasi InfoBMKG) dan BPBD setempat."
 )
+
+# First line of every alert about a synthetic quake (scripts/dev_fake_quake.py).
+TEST_PREFIX = "[TES - BUKAN GEMPA NYATA]"
 
 COMMANDS_HELP = (
     "Perintah:\n"
@@ -121,10 +124,11 @@ class Alert:
     # Origin time of a quake this subscriber was already alerted about that is probably the
     # same event stored as another row (dedup prefers duplicates to wrong merges).
     possible_duplicate_of: datetime | None = None
+    is_test: bool = False  # a synthetic dev quake, not a real one
 
 
 def render_alert(alert: Alert) -> str:
-    lines = []
+    lines = [TEST_PREFIX] if alert.is_test else []
     if alert.possible_duplicate_of is not None:
         lines.append(
             "Catatan: mungkin kejadian yang sama dengan info gempa sebelumnya "
@@ -141,6 +145,6 @@ def render_alert(alert: Alert) -> str:
     if alert.potential:
         lines.append(f"Potensi (BMKG): {alert.potential}")
     if alert.shakemap_url:
-        lines.append(f"Shakemap: {alert.shakemap_url}")
+        lines.append(f"Peta guncangan (shakemap): {alert.shakemap_url}")
     lines.append("Sumber: BMKG")
     return "\n".join(lines)

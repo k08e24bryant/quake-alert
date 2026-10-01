@@ -2,7 +2,6 @@
 
 import logging
 import uuid
-from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 from typing import Any, NoReturn
 
@@ -17,7 +16,8 @@ from app.ingestion.freshness import StalenessMonitor, read_freshness
 from app.ingestion.retention import prune_ingestion_runs
 from app.ingestion.service import FeedIngestionResult, ingest_all_feeds
 from app.notifications.dispatcher import NotifyConfig, RetryDeliveryError, deliver
-from app.notifications.matcher import create_deliveries, pending_delivery_ids
+from app.notifications.matcher import MatchResult, match_flagged, pending_delivery_ids
+from app.notifications.retention import prune_notification_deliveries
 from app.notifications.telegram import TelegramClient
 
 logger = logging.getLogger(__name__)
@@ -44,45 +44,37 @@ async def shutdown(ctx: dict[str, Any]) -> None:
 
 
 async def poll_bmkg_feeds(ctx: dict[str, Any]) -> dict[str, str]:
-    """Fetch all BMKG feeds and ingest them (one ingestion_runs row per feed), then check
-    freshness and re-enqueue any pending delivery that lost its job."""
+    """Sweep what earlier runs left behind, then fetch all BMKG feeds and ingest them (one
+    ingestion_runs row per feed), then check freshness.
+
+    The sweep matches rows still flagged needs_matching (their match job was lost, e.g. the
+    enqueue failed after the feed commit) and re-enqueues pending deliveries whose send job
+    was lost. It runs first, so it only ever picks up what an earlier poll left.
+    """
     redis: ArqRedis = ctx["redis"]  # arq's own connection, to the same Redis the API uses
+    await _sweep(ctx)
 
     async def on_change(result: FeedIngestionResult) -> None:
         await invalidate_latest(redis)
         if result.changed_earthquake_ids:
-            await _enqueue_match(redis, result.changed_earthquake_ids)
+            await _enqueue_match(redis)
 
     results = await ingest_all_feeds(
         ctx["session_factory"], ctx["bmkg_client"], ctx["settings"], on_change=on_change
     )
     await _check_freshness(ctx)
-    await _requeue_pending_deliveries(ctx)
     return {result.feed.value: result.status.value for result in results}
 
 
-async def match_earthquakes(ctx: dict[str, Any], earthquake_ids: list[str]) -> int:
-    """Create deliveries for rows that were inserted or changed, from their current values
-    in the database, and enqueue one send job per new delivery. Idempotent."""
-    settings: Settings = ctx["settings"]
+async def match_earthquakes(ctx: dict[str, Any]) -> int:
+    """Drain the needs_matching outbox: create deliveries for flagged rows from their current
+    values in the database, clear the flags in the same transaction, then enqueue one send
+    job per new delivery. Idempotent; concurrent runs split the rows (SKIP LOCKED)."""
     try:
-        async with ctx["session_factory"]() as session, session.begin():
-            delivery_ids = await create_deliveries(
-                session,
-                [uuid.UUID(earthquake_id) for earthquake_id in earthquake_ids],
-                now=datetime.now(UTC),
-                max_age=timedelta(minutes=settings.notify_max_age_minutes),
-            )
+        result = await _match_flagged(ctx)
     except Exception as exc:
         _retry_or_raise(ctx, exc, "alert matching failed")
-    for delivery_id in delivery_ids:
-        await enqueue_delivery(ctx["redis"], delivery_id)
-    if delivery_ids:
-        logger.info(
-            "alerts matched",
-            extra={"earthquakes": len(earthquake_ids), "deliveries": len(delivery_ids)},
-        )
-    return len(delivery_ids)
+    return len(result.delivery_ids)
 
 
 async def deliver_notification(ctx: dict[str, Any], delivery_id: str) -> str:
@@ -112,14 +104,41 @@ async def enqueue_delivery(redis: ArqRedis, delivery_id: uuid.UUID) -> None:
     )
 
 
-async def _enqueue_match(redis: ArqRedis, earthquake_ids: Iterable[uuid.UUID]) -> None:
-    ids = [str(earthquake_id) for earthquake_id in earthquake_ids]
+async def _enqueue_match(redis: ArqRedis) -> None:
     try:
-        await redis.enqueue_job("match_earthquakes", ids)
+        await redis.enqueue_job("match_earthquakes")
     except Exception:
-        # The rows are committed but won't be matched, so their alerts are missed. Only
-        # possible if Redis fails between ingestion and enqueue; see README.
-        logger.exception("could not enqueue alert matching", extra={"earthquake_ids": ids})
+        # Nothing is lost: the rows stay flagged needs_matching, and the next poll's sweep
+        # matches them.
+        logger.exception("could not enqueue alert matching; the next poll will sweep it")
+
+
+async def _match_flagged(ctx: dict[str, Any]) -> MatchResult:
+    settings: Settings = ctx["settings"]
+    async with ctx["session_factory"]() as session, session.begin():
+        result = await match_flagged(
+            session,
+            now=datetime.now(UTC),
+            max_age=timedelta(minutes=settings.notify_max_age_minutes),
+        )
+    # After the commit. If an enqueue fails, the delivery stays pending and the next poll's
+    # sweep re-enqueues it.
+    for delivery_id in result.delivery_ids:
+        await enqueue_delivery(ctx["redis"], delivery_id)
+    if result.delivery_ids:
+        logger.info(
+            "alerts matched",
+            extra={"earthquakes": len(result.matched), "deliveries": len(result.delivery_ids)},
+        )
+    return result
+
+
+async def _sweep(ctx: dict[str, Any]) -> None:
+    try:
+        await _match_flagged(ctx)
+    except Exception:
+        logger.exception("sweep of flagged earthquakes failed")
+    await _requeue_pending_deliveries(ctx)
 
 
 async def _check_freshness(ctx: dict[str, Any]) -> None:
@@ -163,9 +182,13 @@ def _retry_or_raise(ctx: dict[str, Any], exc: Exception, message: str, **extra: 
     raise Retry(defer=config.backoff_seconds(attempt)) from exc
 
 
-async def prune_old_ingestion_runs(ctx: dict[str, Any]) -> int:
-    """Daily retention for ingestion_runs; see app.ingestion.retention."""
+async def prune_old_records(ctx: dict[str, Any]) -> dict[str, int]:
+    """Daily retention for ingestion_runs and notification_deliveries; see
+    app.ingestion.retention and app.notifications.retention."""
+    now = datetime.now(UTC)
     async with ctx["session_factory"]() as session, session.begin():
-        deleted = await prune_ingestion_runs(session, datetime.now(UTC), ctx["settings"])
-    logger.info("pruned ingestion_runs", extra={"deleted": deleted})
+        runs = await prune_ingestion_runs(session, now, ctx["settings"])
+        deliveries = await prune_notification_deliveries(session, now, ctx["settings"])
+    deleted = {"ingestion_runs": runs, "notification_deliveries": deliveries}
+    logger.info("pruned old records", extra=deleted)
     return deleted

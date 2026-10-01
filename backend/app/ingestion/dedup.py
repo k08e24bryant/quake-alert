@@ -32,6 +32,9 @@ never on the order they were polled in):
       * source_feeds: the feeds present, in precedence order.
   - If a stored payload no longer parses, the row is left exactly as it is and the report
     is reported as SKIPPED, so one bad row never fails a whole feed.
+  - needs_matching is set whenever the row is inserted or a derived column changes, in the
+    same transaction (the outbox the alert matcher drains).
+  - Synthetic rows (dev test quakes) are never match candidates.
   - fingerprint is set by the first report and never changes. When a new row's natural
     fingerprint already belongs to a row it must not merge into, the new row gets a
     salted fingerprint (see _salted_fingerprint), so the key stays unique.
@@ -250,7 +253,13 @@ async def _insert(session: AsyncSession, report: QuakeReport, config: DedupConfi
     for fingerprint in fingerprints:
         row_id: uuid.UUID | None = await session.scalar(
             insert(Earthquake)
-            .values(**derived.columns, location=derived.location, fingerprint=fingerprint, raw=raw)
+            .values(
+                **derived.columns,
+                location=derived.location,
+                fingerprint=fingerprint,
+                raw=raw,
+                needs_matching=True,
+            )
             .on_conflict_do_nothing(index_elements=[Earthquake.fingerprint])
             .returning(Earthquake.id)
         )
@@ -285,6 +294,9 @@ def _merge(match: _Match, report: QuakeReport, config: DedupConfig) -> UpsertRes
     if (match.latitude, match.longitude) != (derived.latitude, derived.longitude):
         row.location = derived.location
         fields_changed = True
+    if fields_changed:
+        # Same transaction as the change itself: the outbox for alert matching.
+        row.needs_matching = True
     raw_changed = row.raw != raw
     if raw_changed:
         row.raw = raw
@@ -293,7 +305,13 @@ def _merge(match: _Match, report: QuakeReport, config: DedupConfig) -> UpsertRes
 
 
 def _select_match() -> Select[tuple[Earthquake, float, float]]:
-    return select(Earthquake, _LATITUDE, _LONGITUDE).with_for_update(of=Earthquake)
+    # A synthetic (dev test) row is never a candidate: a real quake merged into it would be
+    # hidden from the API and alerted as a test.
+    return (
+        select(Earthquake, _LATITUDE, _LONGITUDE)
+        .where(Earthquake.is_synthetic.is_(False))
+        .with_for_update(of=Earthquake)
+    )
 
 
 def _to_match(row: Any) -> _Match | None:

@@ -72,6 +72,12 @@ class Earthquake(Base):
     fingerprint: Mapped[str] = mapped_column(Text, unique=True)
     # Latest raw item per feed, keyed by feed name.
     raw: Mapped[dict[str, Any]] = mapped_column(JSONB)
+    # Transactional outbox for alert matching: set in the same transaction as an insert or
+    # a derived-field change, cleared in the same transaction that creates its deliveries.
+    needs_matching: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
+    # Inserted by scripts/dev_fake_quake.py (dev only). Never in the public API, never a
+    # dedup match, and its alerts are labelled as a test.
+    is_synthetic: Mapped[bool] = mapped_column(Boolean, server_default=text("false"))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -88,6 +94,12 @@ class Earthquake(Base):
             "raw",
             postgresql_using="gin",
             postgresql_ops={"raw": "jsonb_path_ops"},
+        ),
+        # Only the few rows waiting for matching are in it.
+        Index(
+            "ix_earthquakes_needs_matching",
+            "occurred_at",
+            postgresql_where=text("needs_matching"),
         ),
     )
 

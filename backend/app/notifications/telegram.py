@@ -69,6 +69,11 @@ class TelegramClient:
             params["reply_markup"] = reply_markup
         await self.call("sendMessage", params)
 
+    async def get_me(self) -> dict[str, Any]:
+        """The bot this token belongs to (id, username, ...)."""
+        result = await self.call("getMe", {})
+        return result if isinstance(result, dict) else {}
+
     async def get_updates(self, *, offset: int | None, timeout_seconds: int) -> list[Any]:
         """Long polling. Fails with 409 while a webhook is set (see deleteWebhook)."""
         params: dict[str, Any] = {"timeout": timeout_seconds, "allowed_updates": ["message"]}

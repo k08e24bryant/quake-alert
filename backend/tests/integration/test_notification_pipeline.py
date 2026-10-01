@@ -12,7 +12,7 @@ from arq.constants import default_queue_name, job_key_prefix
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import DeliveryStatus, NotificationDelivery
+from app.db.models import DeliveryStatus, Earthquake, NotificationDelivery
 from app.ingestion.domain import Feed
 from tests.bmkg_samples import BASE_URL, load, make_item
 from tests.integration.seed import JAKARTA, seed_quake, seed_subscription
@@ -99,13 +99,49 @@ async def test_fresh_quake_reaches_the_subscriber_once(
     # The same content again: every feed skipped, nothing enqueued, nothing sent.
     await poll_bmkg_feeds(worker_ctx)
     assert await queued(worker_ctx["redis"]) == []
-    # And re-matching the same rows (e.g. a duplicate match job) is a no-op too.
-    earthquake_ids = [
-        str(i) for i in (await db_session.scalars(select(NotificationDelivery.earthquake_id))).all()
-    ]
-    assert await match_earthquakes(worker_ctx, earthquake_ids) == 0
+    # And an extra match job (e.g. a duplicate enqueue) finds nothing flagged.
+    assert await match_earthquakes(worker_ctx) == 0
     assert await drain(worker_ctx) == []
     assert send.call_count == 1
+
+
+async def test_lost_match_enqueue_is_recovered_by_the_next_poll_exactly_once(
+    worker_ctx: dict[str, Any],
+    db_session: AsyncSession,
+    respx_mock: respx.MockRouter,
+    send: respx.Route,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subscription = await seed_subscription(db_session, at=JAKARTA, chat_id=1001)
+    occurred_at = datetime.now(UTC).replace(microsecond=0) - timedelta(minutes=3)
+    serve_bmkg(respx_mock, fresh_autogempa("4.6", occurred_at))
+    redis: ArqRedis = worker_ctx["redis"]
+    real_enqueue = redis.enqueue_job
+
+    async def redis_down_for_match(function: str, *args: Any, **kwargs: Any) -> Any:
+        if function == "match_earthquakes":
+            raise ConnectionError("Redis went away")
+        return await real_enqueue(function, *args, **kwargs)
+
+    # Poll 1: the feed commit succeeds (row stored and flagged), the enqueue fails.
+    monkeypatch.setattr(redis, "enqueue_job", redis_down_for_match)
+    await poll_bmkg_feeds(worker_ctx)
+    monkeypatch.undo()
+    assert await queued(redis) == []
+    assert await deliveries(db_session) == []
+    flagged = select(func.count()).where(Earthquake.needs_matching)
+    assert (await db_session.scalar(flagged) or 0) > 0
+
+    # Poll 2: same content, every feed skipped, but the sweep matches the flagged row.
+    await poll_bmkg_feeds(worker_ctx)
+    await drain(worker_ctx)
+    # Poll 3: nothing left to do.
+    await poll_bmkg_feeds(worker_ctx)
+    await drain(worker_ctx)
+
+    assert [m["chat_id"] for m in sent_messages(send)] == [1001]
+    assert await deliveries(db_session) == [(subscription.id, DeliveryStatus.SENT)]
+    assert await db_session.scalar(flagged) == 0
 
 
 async def test_first_run_backfill_of_old_quakes_sends_nothing(

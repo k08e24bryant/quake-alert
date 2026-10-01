@@ -78,6 +78,8 @@ class Settings(BaseSettings):
     # alert may be the same event reported by another BMKG feed (dedup keeps such duplicates).
     notify_duplicate_window_seconds: int = Field(default=120, ge=0)
     notify_duplicate_distance_km: float = Field(default=100.0, ge=0)
+    # Daily prune: sent/failed deliveries older than this are deleted; pending never are.
+    notification_deliveries_retention_days: int = Field(default=30, ge=1)
 
 
 @lru_cache

@@ -7,6 +7,13 @@ near them.
 Earthquake data: **BMKG (Badan Meteorologi, Klimatologi, dan Geofisika)** —
 <https://data.bmkg.go.id/>.
 
+> Layanan ini tidak resmi dan hanya meneruskan data dari BMKG. Notifikasi bisa terlambat atau tidak terkirim. Untuk informasi resmi dan arahan keselamatan, ikuti BMKG (bmkg.go.id / aplikasi InfoBMKG) dan BPBD setempat.
+
+The bot's `/start` shows this disclaimer word for word, and the frontend footer will too.
+In English: this service is unofficial and only forwards BMKG data; notifications can be
+late or not arrive; for official information and safety guidance, follow BMKG and the local
+disaster agency (BPBD).
+
 ## Ingestion
 
 The worker runs `poll_bmkg_feeds` every minute, on the minute, and once at startup. It
@@ -70,10 +77,14 @@ Each poll works like this:
    another so the same quake from two feeds can't be inserted twice. A feed's quakes and
    its run row commit together.
 
-A second cron job, `prune_old_ingestion_runs`, runs daily at 03:00 UTC. It deletes
-`success`/`skipped` runs older than `INGESTION_RUNS_RETENTION_DAYS` (14) and `failed` runs
-older than `INGESTION_RUNS_FAILED_RETENTION_DAYS` (90). It never deletes a feed's latest
-successful run, because the content-hash skip compares against it.
+A second cron job, `prune_old_records`, runs daily at 03:00 UTC:
+- It deletes `success`/`skipped` ingestion runs older than `INGESTION_RUNS_RETENTION_DAYS`
+  (14) and `failed` runs older than `INGESTION_RUNS_FAILED_RETENTION_DAYS` (90). It never
+  deletes a feed's latest successful run, because the content-hash skip compares against it.
+- It deletes `sent`/`failed` notification deliveries older than
+  `NOTIFICATION_DELIVERIES_RETENTION_DAYS` (30). It never deletes `pending` ones, whatever
+  their age: those are still owed to someone, and they expire on their own (see
+  [From a new quake to a message](#from-a-new-quake-to-a-message)).
 
 `tests/fixtures/bmkg/` holds real responses saved from the live API. The parser is built
 and tested against them.
@@ -107,6 +118,9 @@ Filters for `GET /v1/earthquakes` (unknown parameters are rejected with 422):
 ```sh
 curl 'localhost:8000/v1/earthquakes?lat=-2.53&lon=140.72&radius_km=300&min_mag=4'
 ```
+
+Synthetic test quakes (see [Development](#try-the-whole-alert-path-with-a-fake-quake)) are
+never returned by any endpoint: not listed, not `latest`, and 404 by id.
 
 Response fields: `id`, `occurred_at` (UTC, e.g. `2026-10-01T06:24:52+00:00`), `magnitude`,
 `depth_km`, `latitude`, `longitude`, `region`, `potential`, `felt`, `shakemap_url`,
@@ -221,9 +235,10 @@ SDK.
   change nothing.
 - Only private chats are served. Group and channel messages, and update types the bot
   doesn't handle, are acknowledged and ignored.
-- The bot speaks Indonesian, as BMKG does. Wording rules: no emoji, no alarming words, and
-  never "peringatan dini". This is not an early-warning system, and the disclaimer on
-  `/start` says so. A test checks every text the bot can send against these rules.
+- Everything the bot says is in Indonesian, as BMKG publishes. Wording rules: no emoji, no
+  alarming words, and never "peringatan dini". `/start` includes the
+  [disclaimer](#quake-alert) word for word. Tests check every text the bot can send against
+  these rules, and check the disclaimer against this README.
 
 **Privacy:**
 - Coordinates are rounded to 2 decimals (about 1 km) **before** they are stored. The exact
@@ -264,14 +279,19 @@ and sends the replies with `sendMessage`. It refuses to run with `ENVIRONMENT=pr
 
 ### From a new quake to a message
 
-1. **Trigger.** After each feed commit, ingestion enqueues one `match_earthquakes` job with
-   the rows that were **inserted**, or **updated in a derived column** (time, magnitude,
-   location, depth, region, felt, potential, shakemap). An update that only changed `raw`
-   (e.g. BMKG's local-time `Jam` field) triggers nothing.
-2. **Match**, in SQL, on the rows' current values in PostgreSQL (never a cache):
+1. **Flag (transactional outbox).** When ingestion **inserts** a row, or **changes one of
+   its derived columns** (time, magnitude, location, depth, region, felt, potential,
+   shakemap), it sets `earthquakes.needs_matching = true` in the **same transaction**. An
+   update that only changed `raw` (e.g. BMKG's local-time `Jam` field) flags nothing.
+   After the feed commits, a `match_earthquakes` job is enqueued as the fast path.
+2. **Match**, in SQL, on the rows' current values in PostgreSQL (never a cache). The job
+   locks the flagged rows (`FOR UPDATE SKIP LOCKED`), matches them, and clears their flags
+   in the **same transaction** that inserts the deliveries. Either both happen or neither
+   does. The rule:
    `is_active AND magnitude >= min_magnitude AND ST_DWithin(sub.location, quake.location,
    radius_km * 1000)`. Only quakes whose `occurred_at` is within `NOTIFY_MAX_AGE_MINUTES`
-   (30) are matched, so a first-run backfill of old quakes alerts nobody.
+   (30) are matched. Flagged rows older than that are cleared without notifying anyone and
+   logged, so a first-run backfill of old quakes alerts nobody.
    - Each match inserts a `pending` row into `notification_deliveries`. Its
      `UNIQUE(subscription_id, earthquake_id)` with `ON CONFLICT DO NOTHING` means a row is
      alerted at most once per subscriber, however often it is re-matched.
@@ -294,9 +314,14 @@ and sends the replies with `sendMessage`. It refuses to run with `ENVIRONMENT=pr
      stays `pending`.
    - Errors stored or logged never contain the token, which is part of every Bot API URL.
      The client builds its own messages and drops httpx's.
-4. **Safety net.** Every poll re-enqueues `pending` deliveries of fresh quakes, in case the
-   worker died between committing a delivery and enqueueing its job. The job id makes this
-   a no-op while the job is still queued, running or waiting to retry.
+4. **Sweep.** Each poll starts by running the same matching on whatever is still flagged.
+   A lost match enqueue (Redis failing right after a feed commit, or the worker dying) is
+   therefore recovered on the next poll, exactly once, because the flag and the deliveries
+   change in one transaction. The sweep runs before ingestion, so it only ever picks up
+   what an earlier poll left.
+   - The sweep also re-enqueues `pending` deliveries of fresh quakes, in case a delivery's
+     own job was lost. The job id makes that a no-op while the job is still queued, running
+     or waiting to retry.
 
 Delivery is **at-least-once**. If Telegram accepted a message but recording `sent` failed,
 the retry sends it again. Per the safety principle, a duplicate beats a missed alert.
@@ -311,7 +336,7 @@ Waktu: 01 Okt 2026 13:24:52 WIB
 Kedalaman: 25 km
 Jarak dari lokasi Anda: sekitar 120 km
 Potensi (BMKG): Tidak berpotensi tsunami
-Shakemap: https://data.bmkg.go.id/DataMKG/TEWS/20261001132452.mmi.jpg
+Peta guncangan (shakemap): https://data.bmkg.go.id/DataMKG/TEWS/20261001132452.mmi.jpg
 Sumber: BMKG
 ```
 
@@ -320,7 +345,7 @@ Sumber: BMKG
   location.
 - `Potensi (BMKG)` is BMKG's text verbatim, and is omitted when BMKG gives none. It is never
   labelled as tsunami information.
-- `Shakemap` appears only if BMKG has one.
+- The shakemap line appears only if BMKG has one.
 
 **Known duplicate rows.** Dedup sometimes keeps one event as two rows (see [Design
 decisions](#dedup-prefers-duplicates-over-wrong-merges)). If the subscriber was already
@@ -337,13 +362,11 @@ Catatan: mungkin kejadian yang sama dengan info gempa sebelumnya (01 Okt 2026 13
 - **No revision messages.** After an alert is sent, later changes to the same row (a revised
   magnitude, a new Potensi text, a shakemap) do not produce a follow-up message. The
   subscriber keeps the values from the first alert.
-- **A lost match is not recovered.** If Redis fails after a feed commits but before its
-  match job is enqueued, those rows are never matched, and the error is logged. In practice
-  this needs Redis to die in the milliseconds between the two, and while Redis is down the
-  worker stops anyway (see below).
 - **Possible-duplicate prefix race.** The prefix depends on an earlier alert already being
   `sent`. If the two rows are delivered at the same moment, neither gets the prefix.
-- **No retention for `notification_deliveries` yet.** It grows by one row per alert.
+- **Retention vs. idempotency.** Once a delivery is pruned (after 30 days), nothing stops
+  its row from being matched again. That can't happen in practice: a row is only matched
+  while its quake is at most `NOTIFY_MAX_AGE_MINUTES` old.
 
 ## Design decisions
 
@@ -456,8 +479,9 @@ What recovery does **not** cause:
   history and the API, but not pushed to subscribers as if it were new. A delivery whose
   retries outlived the window is marked failed instead of being sent late.
 - **No double alerts.** `notification_deliveries` is unique per (subscription, row) and
-  lives in PostgreSQL, so re-matching after recovery creates nothing new. Deliveries left
-  `pending` by the outage are re-enqueued by the next poll while still fresh.
+  lives in PostgreSQL, so re-matching after recovery creates nothing new. Rows still flagged
+  `needs_matching` and deliveries left `pending` by the outage are picked up by the first
+  poll's sweep while still fresh.
 
 What an outage **can** cost:
 
@@ -503,6 +527,32 @@ To try the bot locally, create a bot with @BotFather and put its token in `backe
 
 If ports 5432/6379/8000 are taken on your machine, set `POSTGRES_PORT`, `REDIS_PORT` or
 `API_PORT` in the root `.env`, and update the URLs in `backend/.env` to match.
+
+### Try the whole alert path with a fake quake
+
+`scripts/dev_fake_quake.py` inserts a **synthetic** quake near a point and runs matching. The
+running worker then sends the alerts.
+
+```sh
+cd backend
+uv run python -m scripts.dev_fake_quake --lat -6.21 --lon 106.85 --magnitude 5.0
+```
+
+Hard guards, all checked before anything is written:
+1. `ENVIRONMENT=development`.
+2. `TELEGRAM_BOT_TOKEN` is set.
+3. Telegram's `getMe` says the token belongs to a bot whose username ends with `_dev_bot`
+   (create a separate bot with @BotFather for development).
+
+So a production bot's subscribers can never receive a test alert.
+
+The synthetic row is marked `is_synthetic`:
+- It is excluded from every public API response.
+- Dedup never merges a real BMKG report into it. A real quake hidden inside a test row
+  would be a missed alert.
+- Its alert starts with `[TES - BUKAN GEMPA NYATA]`.
+
+By default the quake is placed 10 km north of the point (`--offset-km`).
 
 ### Backend checks
 

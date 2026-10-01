@@ -133,3 +133,13 @@ async def test_get_updates_passes_offset_and_long_poll_timeout(
     assert updates == [{"update_id": 7}]
     assert sent_messages(route) == [{"timeout": 30, "allowed_updates": ["message"], "offset": 7}]
     assert route.calls[0].request.extensions["timeout"]["read"] == 40
+
+
+async def test_get_me_returns_the_bot(
+    telegram: TelegramClient, respx_mock: respx.MockRouter
+) -> None:
+    respx_mock.post(method_url("getMe")).mock(
+        return_value=ok({"id": 1, "is_bot": True, "username": "quake_alert_dev_bot"})
+    )
+
+    assert (await telegram.get_me())["username"] == "quake_alert_dev_bot"

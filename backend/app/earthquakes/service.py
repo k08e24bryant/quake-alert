@@ -20,6 +20,11 @@ from app.schemas.earthquakes import Earthquake, EarthquakeDetail, EarthquakeList
 _NEWEST_FIRST = (EarthquakeRow.occurred_at.desc(), EarthquakeRow.id.desc())
 
 
+def _public() -> Select[Any]:
+    """Every public read starts here: dev test quakes (is_synthetic) are never served."""
+    return select(*_columns(None)).where(EarthquakeRow.is_synthetic.is_(False))
+
+
 def _query_point(lat: float, lon: float) -> ColumnElement[Any]:
     """The query point as geography, so ST_DWithin/ST_Distance work in meters on the
     spheroid and ST_DWithin can use the GIST index on earthquakes.location."""
@@ -55,7 +60,7 @@ def build_list_query(params: EarthquakeQuery) -> Select[Any]:
     if params.lat is not None and params.lon is not None:
         point = _query_point(params.lat, params.lon)
 
-    query = select(*_columns(point))
+    query = select(*_columns(point)).where(EarthquakeRow.is_synthetic.is_(False))
     if point is not None and params.radius_km is not None:
         query = query.where(func.ST_DWithin(EarthquakeRow.location, point, params.radius_km * 1000))
     if params.min_mag is not None:
@@ -113,7 +118,7 @@ class EarthquakeService:
 
         source = await self._source()
         row = (
-            (await self._session.execute(select(*_columns(None)).order_by(*_NEWEST_FIRST).limit(1)))
+            (await self._session.execute(_public().order_by(*_NEWEST_FIRST).limit(1)))
             .mappings()
             .first()
         )
@@ -132,11 +137,7 @@ class EarthquakeService:
     async def get(self, earthquake_id: uuid.UUID) -> EarthquakeDetail | None:
         source = await self._source()
         row = (
-            (
-                await self._session.execute(
-                    select(*_columns(None)).where(EarthquakeRow.id == earthquake_id)
-                )
-            )
+            (await self._session.execute(_public().where(EarthquakeRow.id == earthquake_id)))
             .mappings()
             .first()
         )

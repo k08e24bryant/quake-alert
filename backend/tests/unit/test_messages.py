@@ -2,6 +2,7 @@ import re
 import uuid
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
@@ -40,7 +41,7 @@ def test_alert_has_every_required_field() -> None:
         "Kedalaman: 25 km",
         "Jarak dari lokasi Anda: sekitar 120 km",
         "Potensi (BMKG): Tidak berpotensi tsunami",
-        "Shakemap: https://data.bmkg.go.id/DataMKG/TEWS/20261001132452.mmi.jpg",
+        "Peta guncangan (shakemap): https://data.bmkg.go.id/DataMKG/TEWS/20261001132452.mmi.jpg",
         "Sumber: BMKG",
     ]
 
@@ -58,7 +59,7 @@ def test_optional_lines_are_omitted_when_bmkg_has_no_value() -> None:
     text = render_alert(alert(potential=None, shakemap_url=None))
 
     assert "Potensi" not in text
-    assert "Shakemap" not in text
+    assert "shakemap" not in text
     assert text.endswith("Sumber: BMKG")
 
 
@@ -109,6 +110,7 @@ def _everything_the_bot_can_say() -> list[str]:
         messages.subscription_list(view),
         render_alert(alert()),
         render_alert(alert(possible_duplicate_of=OCCURRED_AT)),
+        render_alert(alert(is_test=True, possible_duplicate_of=OCCURRED_AT)),
     ]
 
 
@@ -122,8 +124,32 @@ def test_no_emoji_and_never_early_warning_wording(text: str) -> None:
 
 def test_start_explains_the_bot_and_includes_the_disclaimer() -> None:
     assert messages.DISCLAIMER in messages.START
-    assert "BMKG" in messages.DISCLAIMER
     for command in ("/radius", "/minmag", "/list", "/stop"):
         assert command in messages.START
     assert "radius 200 km" in messages.START
     assert "magnitudo minimal 4.0" in messages.START
+
+
+# Given by the project owner; must stay word for word in the bot, the README and (later)
+# the frontend footer.
+DISCLAIMER_VERBATIM = (
+    "Layanan ini tidak resmi dan hanya meneruskan data dari BMKG. Notifikasi bisa terlambat "
+    "atau tidak terkirim. Untuk informasi resmi dan arahan keselamatan, ikuti BMKG "
+    "(bmkg.go.id / aplikasi InfoBMKG) dan BPBD setempat."
+)
+README = Path(__file__).resolve().parents[3] / "README.md"
+
+
+def test_disclaimer_is_verbatim_in_the_bot_and_the_readme() -> None:
+    assert messages.DISCLAIMER == DISCLAIMER_VERBATIM
+    readme = " ".join(README.read_text(encoding="utf-8").split())  # ignore line wrapping
+    assert DISCLAIMER_VERBATIM in readme
+
+
+def test_synthetic_quake_alert_starts_with_the_test_label() -> None:
+    text = render_alert(alert(is_test=True, possible_duplicate_of=OCCURRED_AT))
+
+    lines = text.splitlines()
+    assert lines[0] == "[TES - BUKAN GEMPA NYATA]"
+    assert lines[1].startswith("Catatan:")
+    assert not render_alert(alert()).startswith("[TES")

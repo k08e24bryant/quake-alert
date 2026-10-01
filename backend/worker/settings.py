@@ -11,7 +11,7 @@ from worker.jobs import (
     deliver_notification,
     match_earthquakes,
     poll_bmkg_feeds,
-    prune_old_ingestion_runs,
+    prune_old_records,
     shutdown,
     startup,
 )
@@ -39,7 +39,7 @@ class WorkerSettings:
             max_tries=1,  # the next minute is the retry
         ),
         cron(
-            prune_old_ingestion_runs,
+            prune_old_records,
             hour=3,  # daily at 03:00 UTC
             minute=0,
             unique=True,
