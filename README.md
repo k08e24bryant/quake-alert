@@ -15,10 +15,15 @@ reads three BMKG feeds from `https://data.bmkg.go.id/DataMKG/TEWS/`:
 | Feed                  | Contents               | Extra fields                                 |
 |-----------------------|------------------------|----------------------------------------------|
 | `autogempa.json`      | latest single quake    | `Potensi`, `Dirasakan`, `Shakemap` image     |
-| `gempaterkini.json`   | latest 15 quakes, M5+  | `Potensi` (tsunami potential)                |
+| `gempaterkini.json`   | latest 15 quakes, M5+  | `Potensi`                                    |
 | `gempadirasakan.json` | latest 15 felt quakes  | `Dirasakan` (MMI felt report)                |
 
 BMKG publishes no history endpoint, so the history is whatever this service collects.
+
+`Potensi` is BMKG's free text, stored verbatim as `potential`. It is usually a tsunami
+statement, but not always: autogempa may say "Gempa ini dirasakan untuk diteruskan pada
+masyarakat" ("this quake was felt; pass it on to the public"). It must never be presented as
+tsunami information.
 
 Each poll works like this:
 
@@ -31,7 +36,7 @@ Each poll works like this:
    - string numbers (`"5.2"`, `"10 km"`) become numbers;
    - `"lat,lon"` becomes coordinates;
    - time comes from the UTC `DateTime` field, never the local `Tanggal`/`Jam`;
-   - a malformed item is logged and skipped.
+   - a malformed item is logged, skipped and counted in the run's `skipped_count`.
 4. **Deduplicate** (`app/ingestion/dedup.py`). BMKG has no quake ID, so a report is the
    same quake as an existing row when either:
    - its fingerprint matches: the UTC time to the second plus lat/lon rounded to 2
@@ -39,13 +44,26 @@ Each poll works like this:
    - it is within `DEDUP_MAX_TIME_DIFF_SECONDS` (60) **and** `DEDUP_MAX_DISTANCE_KM` (50)
      of that row.
 
-   On a match the reports are merged: the latest measurements win, and felt info,
-   tsunami potential and the shakemap are kept from whichever feed has them. `source_feeds`
-   and `raw` record every feed the quake came from.
+   On a match the report replaces its own feed's payload in `raw` (one entry per feed).
+   All other columns are then re-derived from `raw` by feed precedence,
+   **autogempa > gempaterkini > gempadirasakan**:
+   - time, magnitude, location, depth and region come from the highest-precedence feed
+     present;
+   - `felt`, `potential` and `shakemap_url` come from the highest-precedence feed that has a
+     value.
+
+   A row therefore depends only on which payloads it holds, never on poll order. A revision
+   inside a feed is applied, because it replaces that feed's payload. The fingerprint is
+   set by the first report and never changes.
 5. **Record** one `ingestion_runs` row per feed: `success`, `skipped` or `failed`, with
    counts and the error. Fetches run concurrently, but feeds are processed one after
    another so the same quake from two feeds can't be inserted twice. A feed's quakes and
    its run row commit together.
+
+A second cron job, `prune_old_ingestion_runs`, runs daily at 03:00 UTC. It deletes
+`success`/`skipped` runs older than `INGESTION_RUNS_RETENTION_DAYS` (14) and `failed` runs
+older than `INGESTION_RUNS_FAILED_RETENTION_DAYS` (90). It never deletes a feed's latest
+successful run, because the content-hash skip compares against it.
 
 `tests/fixtures/bmkg/` holds real responses saved from the live API. The parser is built
 and tested against them.
