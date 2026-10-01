@@ -57,7 +57,7 @@ def compute_fingerprint(occurred_at: datetime, latitude: Decimal, longitude: Dec
 
 
 def distance_km(lat1: Decimal, lon1: Decimal, lat2: Decimal, lon2: Decimal) -> float:
-    """Great-circle (haversine) distance. Within ~0.5% of PostGIS geography distance, which is
+    """Great-circle (haversine) distance. Within ~0.6% of PostGIS geography distance, which is
     plenty for a coarse guard like SAME_FEED_REVISION_MAX_KM."""
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
     d_phi = phi2 - phi1

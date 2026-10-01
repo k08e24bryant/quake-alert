@@ -63,7 +63,8 @@ class Earthquake(Base):
 
     __table_args__ = (
         Index("ix_earthquakes_location", "location", postgresql_using="gist"),
-        Index("ix_earthquakes_occurred_at", text("occurred_at DESC")),
+        # Newest-first listing and keyset pagination on (occurred_at DESC, id DESC).
+        Index("ix_earthquakes_occurred_at_id", text("occurred_at DESC"), text("id DESC")),
         Index("ix_earthquakes_magnitude", "magnitude"),
         # Serves the same-feed revision lookup: raw @> {"<feed>": {"DateTime": "..."}}.
         Index(

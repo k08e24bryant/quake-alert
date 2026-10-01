@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     database_max_overflow: int = 5
 
     redis_url: str = "redis://localhost:6379/0"
+    # Short, so a dead Redis degrades the API (cache bypass, no rate limiting) instead of
+    # stalling every request.
+    redis_socket_timeout_seconds: float = Field(default=0.5, gt=0)
 
     readiness_timeout_seconds: float = 2.0
 
@@ -36,6 +39,16 @@ class Settings(BaseSettings):
     # because the content-hash skip compares against it.
     ingestion_runs_retention_days: int = Field(default=14, ge=1)  # success and skipped runs
     ingestion_runs_failed_retention_days: int = Field(default=90, ge=1)
+
+    # Query API caching. `latest` is also invalidated by ingestion; the TTL only bounds
+    # staleness if an invalidation is missed (e.g. Redis briefly unreachable from the worker).
+    cache_latest_ttl_seconds: int = Field(default=60, ge=1)
+    cache_list_ttl_seconds: int = Field(default=30, ge=1)
+
+    # Per-client-IP fixed-window rate limit for /v1.
+    rate_limit_per_minute: int = Field(default=60, ge=1)
+    # Only enable behind a proxy you control (Caddy): clients can forge X-Forwarded-For.
+    trust_proxy_headers: bool = False
 
 
 @lru_cache

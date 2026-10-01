@@ -1,0 +1,59 @@
+"""Insert earthquakes rows directly, for API tests that need exact data (not ingestion)."""
+
+import uuid
+from datetime import datetime
+from decimal import Decimal
+
+from geoalchemy2 import WKTElement
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.db.models import Earthquake
+from app.ingestion.domain import Feed
+from tests.bmkg_samples import DEFAULT_TIME, make_item
+
+# Reference points (lat, lon). Distances between them are well known; see the tests.
+JAKARTA = (-6.2088, 106.8456)
+BOGOR = (-6.5971, 106.8060)
+BANDUNG = (-6.9175, 107.6191)
+SURABAYA = (-7.2575, 112.7521)
+
+
+async def seed_quake(
+    session: AsyncSession,
+    *,
+    at: tuple[float, float] = JAKARTA,
+    occurred_at: datetime = DEFAULT_TIME,
+    magnitude: str = "5.0",
+    depth_km: int = 10,
+    region: str = "test region",
+    potential: str | None = None,
+    felt: str | None = None,
+    feed: Feed = Feed.GEMPATERKINI,
+) -> Earthquake:
+    lat, lon = at
+    item = make_item(
+        occurred_at=occurred_at,
+        magnitude=magnitude,
+        depth_km=depth_km,
+        latitude=str(lat),
+        longitude=str(lon),
+        region=region,
+        potential=potential,
+        felt=felt,
+    )
+    row = Earthquake(
+        occurred_at=occurred_at,
+        magnitude=Decimal(magnitude),
+        depth_km=depth_km,
+        location=WKTElement(f"POINT({lon} {lat})", srid=4326),
+        region=region,
+        potential=potential,
+        felt=felt,
+        shakemap_url=None,
+        source_feeds=[feed.value],
+        fingerprint=uuid.uuid4().hex,  # rows here may deliberately share time and place
+        raw={feed.value: item},
+    )
+    session.add(row)
+    await session.flush()
+    return row

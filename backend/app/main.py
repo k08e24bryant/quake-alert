@@ -3,9 +3,10 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from app.api import health
+from app.api import earthquakes, health
 from app.core.config import Settings, get_settings
 from app.core.logging import configure_logging
+from app.core.rate_limit import RateLimiter
 from app.core.redis import create_redis
 from app.db.session import create_engine, create_sessionmaker
 
@@ -17,11 +18,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         configure_logging(app_settings.log_level)
         engine = create_engine(app_settings)
-        redis = create_redis(app_settings.redis_url)
+        redis = create_redis(app_settings.redis_url, app_settings.redis_socket_timeout_seconds)
         app.state.settings = app_settings
         app.state.engine = engine
         app.state.sessionmaker = create_sessionmaker(engine)
         app.state.redis = redis
+        app.state.rate_limiter = RateLimiter(redis, limit=app_settings.rate_limit_per_minute)
         try:
             yield
         finally:
@@ -30,6 +32,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(title="Quake Alert", version="0.1.0", lifespan=lifespan)
     app.include_router(health.router)
+    app.include_router(earthquakes.router)
     return app
 
 

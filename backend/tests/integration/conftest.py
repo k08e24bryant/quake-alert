@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 from alembic import command
 from alembic.config import Config
+from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from redis.asyncio import Redis
@@ -148,3 +149,23 @@ async def client(app_settings: Settings) -> AsyncIterator[AsyncClient]:
         AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client,
     ):
         yield client
+
+
+@pytest.fixture
+async def api_app(
+    app_settings: Settings,
+    session_factory: async_sessionmaker[AsyncSession],
+    redis_client: Redis,
+) -> AsyncIterator[FastAPI]:
+    """The app with its DB sessions bound to the rolled-back test transaction, so rows a
+    test seeds are visible to the API and vanish afterwards. Redis is the (flushed) test db."""
+    app = create_app(app_settings)
+    async with app.router.lifespan_context(app):
+        app.state.sessionmaker = session_factory
+        yield app
+
+
+@pytest.fixture
+async def api(api_app: FastAPI) -> AsyncIterator[AsyncClient]:
+    async with AsyncClient(transport=ASGITransport(app=api_app), base_url="http://test") as c:
+        yield c

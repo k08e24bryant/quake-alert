@@ -1,8 +1,13 @@
 from redis.asyncio import Redis
 
 
-def create_redis(url: str) -> Redis:
-    redis: Redis = Redis.from_url(url, decode_responses=True)
+def create_redis(url: str, timeout_seconds: float) -> Redis:
+    redis: Redis = Redis.from_url(
+        url,
+        decode_responses=True,
+        socket_connect_timeout=timeout_seconds,
+        socket_timeout=timeout_seconds,
+    )
     return redis
 
 

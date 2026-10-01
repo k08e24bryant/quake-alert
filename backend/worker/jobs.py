@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.core.config import get_settings
 from app.db.session import create_engine, create_sessionmaker
+from app.earthquakes.cache import invalidate_latest
 from app.ingestion.bmkg_client import BmkgClient, create_http_client
 from app.ingestion.retention import prune_ingestion_runs
 from app.ingestion.service import ingest_all_feeds
@@ -34,7 +35,14 @@ async def shutdown(ctx: dict[str, Any]) -> None:
 
 async def poll_bmkg_feeds(ctx: dict[str, Any]) -> dict[str, str]:
     """Fetch all BMKG feeds and ingest them; one ingestion_runs row per feed."""
-    results = await ingest_all_feeds(ctx["session_factory"], ctx["bmkg_client"], ctx["settings"])
+
+    async def invalidate_api_cache() -> None:
+        # ctx["redis"] is arq's own connection, to the same Redis the API caches in.
+        await invalidate_latest(ctx["redis"])
+
+    results = await ingest_all_feeds(
+        ctx["session_factory"], ctx["bmkg_client"], ctx["settings"], on_change=invalidate_api_cache
+    )
     return {result.feed.value: result.status.value for result in results}
 
 

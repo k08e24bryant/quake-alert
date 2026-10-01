@@ -80,6 +80,81 @@ and tested against them.
 A regression test checks that every saved fixture still parses with the current parser,
 because stored payloads are re-parsed on every merge.
 
+## Query API
+
+Interactive docs are at `/docs` (OpenAPI at `/openapi.json`). Every response includes a
+`source` object attributing the data to BMKG.
+
+| Endpoint | Returns |
+|---|---|
+| `GET /v1/earthquakes` | A page of earthquakes, newest first, plus `next_cursor` |
+| `GET /v1/earthquakes/latest` | The most recent earthquake (404 if none yet) |
+| `GET /v1/earthquakes/{id}` | One earthquake (404 if unknown) |
+
+Filters for `GET /v1/earthquakes` (unknown parameters are rejected with 422):
+
+| Parameter | Rule |
+|---|---|
+| `lat`, `lon` | Given together. Adds `distance_km` to each result, computed by PostGIS `ST_Distance` on `geography` (geodesic, in meters, divided by 1000). |
+| `radius_km` | Requires `lat` and `lon`; `0 < radius_km ≤ 1000`. Uses `ST_DWithin` on `geography`. |
+| `min_mag`, `max_mag` | Inclusive; `min_mag ≤ max_mag`. |
+| `start`, `end` | ISO 8601 **with offset** (naive times are rejected). `start` is inclusive, `end` exclusive. The range is at most 366 days; if only `start` is given, `end` counts as now. |
+| `limit` | 1–100, default 20. |
+| `cursor` | The previous page's `next_cursor`. |
+
+```sh
+curl 'localhost:8000/v1/earthquakes?lat=-2.53&lon=140.72&radius_km=300&min_mag=4'
+```
+
+Response fields: `id`, `occurred_at` (UTC, e.g. `2026-10-01T06:24:52+00:00`), `magnitude`,
+`depth_km`, `latitude`, `longitude`, `region`, `potential`, `felt`, `shakemap_url`,
+`source_feeds`, `distance_km`. `potential` is BMKG's verbatim `Potensi` text and is **not**
+tsunami information. Internal fields (`raw`, `fingerprint`) are never exposed.
+
+**Pagination** is keyset-based on `(occurred_at DESC, id DESC)`. The cursor encodes the last
+row of the page, and the next page holds rows strictly after it. Rows that share an
+`occurred_at` are split deterministically by `id`, and quakes ingested while you page never
+shift or repeat later pages.
+
+**Caching** (Redis):
+- `latest` is cached and deleted by the worker whenever ingestion inserts or updates a row.
+  `CACHE_LATEST_TTL_SECONDS` (60) bounds staleness if an invalidation is ever missed.
+- List queries are cached for `CACHE_LIST_TTL_SECONDS` (30). The key comes from the
+  *validated* parameters, so parameter order, number spelling (`-6.2` vs `-6.20`) and
+  timezone offsets of the same instant all share one entry.
+- The `X-Cache` header is `HIT`, `MISS` or `BYPASS`.
+- **If Redis is down**, the API answers from the database (`X-Cache: BYPASS`) and rate
+  limiting is skipped. `/readyz` reports Redis as failing, but requests keep succeeding.
+  Redis calls time out after `REDIS_SOCKET_TIMEOUT_SECONDS` (0.5).
+
+**Rate limiting** applies to `/v1/*` only, per client IP, with a fixed window of
+`RATE_LIMIT_PER_MINUTE` (60) requests per minute.
+- Every response carries `X-RateLimit-Limit`, `X-RateLimit-Remaining` and
+  `X-RateLimit-Reset` (seconds until the window resets).
+- Over the limit, the response is `429` with `Retry-After`.
+- The client IP is the socket peer. With `TRUST_PROXY_HEADERS=true` (only behind Caddy), it
+  is the **last** `X-Forwarded-For` entry, the one our proxy appended. Earlier entries are
+  client-controlled and ignored.
+
+### Query plans
+
+Measured with `EXPLAIN ANALYZE` on PostgreSQL 16 / PostGIS 3.5, using 100,000 synthetic
+quakes spread over Indonesia across one year (query point Jakarta, `limit=20`):
+
+| Query | Plan | Execution |
+|---|---|---|
+| `radius_km=100` (342 matches) | Bitmap Index Scan on **`ix_earthquakes_location`** (GIST) → top-N sort | 6.9 ms |
+| `radius_km=1000` (~27k matches) | Bitmap Index Scan on **`ix_earthquakes_location`** (GIST), parallel heap scan → top-N sort | 151 ms |
+| no filters | Index Scan on `ix_earthquakes_occurred_at_id` | 0.05 ms |
+| next page (`cursor`) | Index Scan on `ix_earthquakes_occurred_at_id`, `Index Cond: ROW(occurred_at, id) < ROW(...)` | 6.4 ms |
+
+The GIST index is used through `ST_DWithin`'s `&&` bounding-box condition, and the exact
+distance check runs on the candidates it returns. Large radii cost more, because every
+matching row is sorted by time before the page is cut. That is one reason `radius_km` is
+capped at 1000. `tests/integration/test_query_plans.py` guards the index usage: it seeds
+20k rows, runs `ANALYZE`, and asserts that the radius query plan uses
+`ix_earthquakes_location` with no sequential scan.
+
 ## Design decisions
 
 ### Dedup prefers duplicates over wrong merges

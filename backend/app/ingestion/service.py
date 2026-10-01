@@ -3,6 +3,7 @@ import hashlib
 import json
 import logging
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -43,15 +44,21 @@ def content_hash(payload: Any) -> str:
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
+OnChange = Callable[[], Awaitable[None]]
+
+
 async def ingest_all_feeds(
     session_factory: async_sessionmaker[AsyncSession],
     client: BmkgClient,
     settings: Settings,
+    on_change: OnChange | None = None,
 ) -> list[FeedIngestionResult]:
     """Fetch every feed concurrently, then process them one at a time.
 
     Processing is sequential on purpose: the same quake appears in several feeds, and
     concurrent upserts of near-duplicates (different fingerprints) could both insert.
+    `on_change` runs after each feed commit that inserted or updated rows (e.g. to
+    invalidate the API's `latest` cache).
     """
     feeds = list(Feed)
     fetched_at = datetime.now(UTC)
@@ -60,9 +67,10 @@ async def ingest_all_feeds(
     for feed, payload in zip(feeds, payloads, strict=True):
         if isinstance(payload, BaseException) and not isinstance(payload, Exception):
             raise payload  # cancellation and friends must propagate
-        results.append(
-            await ingest_feed_payload(session_factory, feed, payload, fetched_at, settings)
-        )
+        result = await ingest_feed_payload(session_factory, feed, payload, fetched_at, settings)
+        if on_change is not None and (result.inserted_count or result.updated_count):
+            await on_change()
+        results.append(result)
     return results
 
 
