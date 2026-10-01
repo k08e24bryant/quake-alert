@@ -1,3 +1,4 @@
+import uuid
 from datetime import timedelta
 from decimal import Decimal
 from typing import Any
@@ -325,3 +326,143 @@ async def test_all_real_samples_dedupe_to_distinct_quakes(db_session: AsyncSessi
         )
     ).all()
     assert [row.source_feeds for row in merged] == [["autogempa", "gempadirasakan"]]
+
+
+# --- never merge distinct quakes ----------------------------------------------------------
+
+
+def aftershock_pair(feed: Feed = Feed.GEMPATERKINI) -> tuple[QuakeReport, QuakeReport]:
+    """Two distinct quakes 30 s and ~10 km apart: inside the fuzzy thresholds."""
+    main = make_report(feed, magnitude="5.8")
+    aftershock = make_report(
+        feed,
+        occurred_at=DEFAULT_TIME + timedelta(seconds=30),
+        latitude="-2.55",
+        magnitude="5.1",
+    )
+    return main, aftershock
+
+
+async def upsert_snapshot(session: AsyncSession, *reports: QuakeReport) -> list[UpsertOutcome]:
+    """Upsert reports as items of ONE feed snapshot (sharing the claimed-rows set)."""
+    claimed: set[uuid.UUID] = set()
+    return [await upsert_report(session, report, CONFIG, claimed) for report in reports]
+
+
+async def test_aftershocks_in_one_snapshot_are_two_rows(db_session: AsyncSession) -> None:
+    outcomes = await upsert_snapshot(db_session, *aftershock_pair())
+
+    assert outcomes == [UpsertOutcome.INSERTED, UpsertOutcome.INSERTED]
+    assert await count_rows(db_session) == 2
+
+
+async def test_aftershocks_in_consecutive_polls_of_one_feed_are_two_rows(
+    db_session: AsyncSession,
+) -> None:
+    main, aftershock = aftershock_pair()
+
+    assert await upsert_all(db_session, main, aftershock) == [
+        UpsertOutcome.INSERTED,
+        UpsertOutcome.INSERTED,
+    ]
+    assert await count_rows(db_session) == 2
+
+
+async def test_snapshot_with_aftershocks_is_stable_across_polls(db_session: AsyncSession) -> None:
+    pair = aftershock_pair()
+
+    await upsert_snapshot(db_session, *pair)
+    again = await upsert_snapshot(db_session, *pair)
+
+    assert again == [UpsertOutcome.UNCHANGED, UpsertOutcome.UNCHANGED]
+    magnitudes = sorted((await db_session.scalars(select(Earthquake.magnitude))).all())
+    assert magnitudes == [Decimal("5.1"), Decimal("5.8")]
+
+
+async def test_same_feed_revision_with_moved_coordinates_updates_the_row(
+    db_session: AsyncSession,
+) -> None:
+    original = make_report(Feed.GEMPATERKINI, latitude="-2.46", longitude="140.38")
+    moved = make_report(Feed.GEMPATERKINI, latitude="-2.64", longitude="140.51")  # ~25 km
+    assert moved.fingerprint != original.fingerprint
+
+    assert await upsert_all(db_session, original, moved) == [
+        UpsertOutcome.INSERTED,
+        UpsertOutcome.UPDATED,
+    ]
+
+    row = await only_row(db_session)
+    assert await coordinates(db_session, row) == pytest.approx((-2.64, 140.51))
+    assert row.fingerprint == original.fingerprint
+
+
+async def test_cross_feed_near_duplicate_is_still_merged(db_session: AsyncSession) -> None:
+    terkini = make_report(Feed.GEMPATERKINI)
+    dirasakan = make_report(
+        Feed.GEMPADIRASAKAN,
+        occurred_at=DEFAULT_TIME + timedelta(seconds=30),
+        latitude="-2.55",
+        felt="III Jayapura",
+    )
+
+    assert await upsert_all(db_session, terkini, dirasakan) == [
+        UpsertOutcome.INSERTED,
+        UpsertOutcome.UPDATED,
+    ]
+    assert (await only_row(db_session)).source_feeds == ["gempaterkini", "gempadirasakan"]
+
+
+async def test_aftershock_of_a_cross_feed_merged_quake_gets_its_own_row(
+    db_session: AsyncSession,
+) -> None:
+    main_terkini, aftershock_terkini = aftershock_pair(Feed.GEMPATERKINI)
+    main_dirasakan = make_report(Feed.GEMPADIRASAKAN, magnitude="5.8", felt="IV Jayapura")
+    await upsert_all(db_session, main_terkini, main_dirasakan)
+    assert await count_rows(db_session) == 1
+
+    assert await upsert_report(db_session, aftershock_terkini, CONFIG) is UpsertOutcome.INSERTED
+
+    rows = (await db_session.scalars(select(Earthquake).order_by(Earthquake.occurred_at))).all()
+    assert [(r.magnitude, r.source_feeds) for r in rows] == [
+        (Decimal("5.8"), ["gempaterkini", "gempadirasakan"]),
+        (Decimal("5.1"), ["gempaterkini"]),
+    ]
+
+
+async def test_identical_fingerprints_in_one_snapshot_get_distinct_rows(
+    db_session: AsyncSession,
+) -> None:
+    # Same second, positions equal after rounding to 2 decimals: same natural fingerprint.
+    first = make_report(Feed.GEMPATERKINI, latitude="-2.461", magnitude="5.0")
+    second = make_report(Feed.GEMPATERKINI, latitude="-2.459", magnitude="4.2")
+    assert first.fingerprint == second.fingerprint
+
+    await upsert_snapshot(db_session, first, second)
+    # The next poll must resolve each item to its own row again.
+    again = await upsert_snapshot(db_session, first, second)
+
+    assert again == [UpsertOutcome.UNCHANGED, UpsertOutcome.UNCHANGED]
+    rows = (await db_session.scalars(select(Earthquake).order_by(Earthquake.magnitude))).all()
+    assert [r.magnitude for r in rows] == [Decimal("4.2"), Decimal("5.0")]
+    assert rows[1].fingerprint == first.fingerprint
+    assert rows[0].fingerprint != first.fingerprint  # salted, still unique
+
+
+# --- resilience ---------------------------------------------------------------------------
+
+
+async def test_unparseable_stored_payload_leaves_the_row_unchanged(
+    db_session: AsyncSession,
+) -> None:
+    await upsert_report(db_session, make_report(Feed.GEMPATERKINI), CONFIG)
+    row = await only_row(db_session)
+    row.raw = {"gempaterkini": {**row.raw["gempaterkini"], "Magnitude": "not a number"}}
+    await db_session.flush()
+    before = await snapshot(db_session)
+
+    outcome = await upsert_report(
+        db_session, make_report(Feed.GEMPADIRASAKAN, felt="III Jayapura"), CONFIG
+    )
+
+    assert outcome is UpsertOutcome.SKIPPED
+    assert await snapshot(db_session) == before

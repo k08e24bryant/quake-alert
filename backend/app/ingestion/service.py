@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -25,7 +26,9 @@ class FeedIngestionResult:
     status: IngestionStatus
     inserted_count: int = 0
     updated_count: int = 0
-    skipped_count: int = 0  # malformed items the parser dropped
+    # Items not stored: malformed ones the parser dropped, plus items whose matching row
+    # has a stored payload that no longer parses (that row is left unchanged).
+    skipped_count: int = 0
     error: str | None = None
 
 
@@ -108,13 +111,15 @@ async def _store_reports(
 ) -> FeedIngestionResult:
     config = DedupConfig.from_settings(settings)
     parsed = parse_feed(feed, payload, settings.bmkg_base_url)
-    outcomes = [await upsert_report(session, report, config) for report in parsed.reports]
+    # Items of one snapshot are distinct quakes: none may resolve to a row another claimed.
+    claimed: set[uuid.UUID] = set()
+    outcomes = [await upsert_report(session, report, config, claimed) for report in parsed.reports]
     return FeedIngestionResult(
         feed,
         IngestionStatus.SUCCESS,
         inserted_count=outcomes.count(UpsertOutcome.INSERTED),
         updated_count=outcomes.count(UpsertOutcome.UPDATED),
-        skipped_count=parsed.skipped_count,
+        skipped_count=parsed.skipped_count + outcomes.count(UpsertOutcome.SKIPPED),
     )
 
 

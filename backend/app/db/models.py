@@ -65,6 +65,13 @@ class Earthquake(Base):
         Index("ix_earthquakes_location", "location", postgresql_using="gist"),
         Index("ix_earthquakes_occurred_at", text("occurred_at DESC")),
         Index("ix_earthquakes_magnitude", "magnitude"),
+        # Serves the same-feed revision lookup: raw @> {"<feed>": {"DateTime": "..."}}.
+        Index(
+            "ix_earthquakes_raw",
+            "raw",
+            postgresql_using="gin",
+            postgresql_ops={"raw": "jsonb_path_ops"},
+        ),
     )
 
 
@@ -80,7 +87,8 @@ class IngestionRun(Base):
     content_hash: Mapped[str | None] = mapped_column(Text)
     inserted_count: Mapped[int] = mapped_column(Integer, server_default="0")
     updated_count: Mapped[int] = mapped_column(Integer, server_default="0")
-    # Feed items the parser dropped as malformed (unrelated to the `skipped` status).
+    # Items not stored: malformed ones the parser dropped, plus items whose matching row has a
+    # stored payload that no longer parses. Unrelated to the `skipped` status.
     skipped_count: Mapped[int] = mapped_column(Integer, server_default="0")
     error: Mapped[str | None] = mapped_column(Text)
 

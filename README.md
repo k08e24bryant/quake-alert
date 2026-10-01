@@ -37,12 +37,18 @@ Each poll works like this:
    - `"lat,lon"` becomes coordinates;
    - time comes from the UTC `DateTime` field, never the local `Tanggal`/`Jam`;
    - a malformed item is logged, skipped and counted in the run's `skipped_count`.
-4. **Deduplicate** (`app/ingestion/dedup.py`). BMKG has no quake ID, so a report is the
-   same quake as an existing row when either:
-   - its fingerprint matches: the UTC time to the second plus lat/lon rounded to 2
-     decimals; or
-   - it is within `DEDUP_MAX_TIME_DIFF_SECONDS` (60) **and** `DEDUP_MAX_DISTANCE_KM` (50)
-     of that row.
+4. **Deduplicate** (`app/ingestion/dedup.py`). BMKG has no quake ID. A report from feed F
+   resolves to an existing row by the first rule that matches:
+   1. **Same-feed revision:** the row already holds an F payload with the identical
+      `DateTime`. It is the same quake, even if coordinates or magnitude moved.
+   2. **Exact fingerprint** (UTC time to the second plus lat/lon rounded to 2 decimals),
+      from another feed.
+   3. **Fuzzy**, from another feed: within `DEDUP_MAX_TIME_DIFF_SECONDS` (60) **and**
+      `DEDUP_MAX_DISTANCE_KM` (50).
+
+   Rules 2 and 3 never match a row that already holds an F payload, and no two items of
+   one snapshot may resolve to the same row. Otherwise the report becomes a new row. See
+   [Design decisions](#design-decisions) for why.
 
    On a match the report replaces its own feed's payload in `raw` (one entry per feed).
    All other columns are then re-derived from `raw` by feed precedence,
@@ -52,9 +58,12 @@ Each poll works like this:
    - `felt`, `potential` and `shakemap_url` come from the highest-precedence feed that has a
      value.
 
-   A row therefore depends only on which payloads it holds, never on poll order. A revision
-   inside a feed is applied, because it replaces that feed's payload. The fingerprint is
-   set by the first report and never changes.
+   A row therefore depends only on which payloads it holds, never on poll order. The
+   fingerprint is set by the first report and never changes.
+
+   If a row's stored payload no longer parses, that row is left as it is, the error is
+   logged with the row id, and the item counts toward `skipped_count`. The rest of the run
+   goes on.
 5. **Record** one `ingestion_runs` row per feed: `success`, `skipped` or `failed`, with
    counts and the error. Fetches run concurrently, but feeds are processed one after
    another so the same quake from two feeds can't be inserted twice. A feed's quakes and
@@ -67,6 +76,45 @@ successful run, because the content-hash skip compares against it.
 
 `tests/fixtures/bmkg/` holds real responses saved from the live API. The parser is built
 and tested against them.
+A regression test checks that every saved fixture still parses with the current parser,
+because stored payloads are re-parsed on every merge.
+
+## Design decisions
+
+### Dedup prefers duplicates over wrong merges
+
+Getting dedup wrong has two possible costs, and they are not equal:
+
+| Mistake | What a subscriber experiences |
+|---|---|
+| Two distinct quakes merged into one row | The second quake disappears: a **missed alert** |
+| One quake stored as two rows | At most a **duplicate alert** |
+
+A missed alert is the worse failure for an alert service, so whenever the data is
+ambiguous, dedup creates a new row:
+
+- **Items in one feed snapshot are always distinct.** A feed never lists the same quake
+  twice, so two items from one response never resolve to the same row, however close they
+  are. Aftershock sequences are the case this protects, e.g. M5.8 then M5.1 thirty seconds
+  later and 10 km away.
+- **Within a feed, `DateTime` is identity.** The same feed reporting the same second again
+  is a revision and gets merged, even if the coordinates moved. A different second from the
+  same feed is a different quake, even within 60 s and 50 km. A `DateTime` revision inside
+  one feed therefore produces a duplicate row. That cost is accepted.
+- **Fuzzy matching is only for reconciling different feeds.** Feeds describe the same quake
+  with slightly different numbers. A row that already holds a payload from the incoming feed
+  with a different `DateTime` is excluded, because that feed has already told us it is a
+  different quake.
+- **`DateTime` is compared as BMKG's own string.** If BMKG ever changed the format, the
+  comparison would fail toward a duplicate, never a merge.
+- **Fingerprints stay unique.** When a forced-distinct row's natural fingerprint is already
+  taken (e.g. two items of one snapshot at the same second and same rounded position), the
+  new row gets a salted fingerprint.
+
+Remaining duplicate risk: one quake reported at different seconds by the same feed over
+time, or reported by two feeds outside the fuzzy thresholds. Notification code (Phase 3)
+should therefore make a duplicate alert recognisable rather than assume rows are unique
+quakes.
 
 ## Development
 
