@@ -1,0 +1,87 @@
+import pytest
+from alembic.config import Config
+from alembic.script import ScriptDirectory
+from sqlalchemy import URL, make_url, text
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+
+from tests.integration.conftest import (
+    BACKEND_DIR,
+    IntegrationSettings,
+    drop_database,
+    recreate_database,
+    run_alembic,
+)
+
+JAKARTA = "SRID=4326;POINT(106.8456 -6.2088)"
+BOGOR = "SRID=4326;POINT(106.8060 -6.5971)"
+
+
+async def test_postgis_extension_is_installed(db_session: AsyncSession) -> None:
+    version = await db_session.scalar(
+        text("SELECT extversion FROM pg_extension WHERE extname = 'postgis'")
+    )
+    assert version is not None
+    assert version.startswith("3.")
+
+
+async def test_geography_distance_is_in_meters(db_session: AsyncSession) -> None:
+    distance_m = await db_session.scalar(
+        text("SELECT ST_Distance(CAST(:a AS geography), CAST(:b AS geography))"),
+        {"a": JAKARTA, "b": BOGOR},
+    )
+    assert distance_m is not None
+    assert 42_000 < distance_m < 45_000
+
+    within_50km = await db_session.scalar(
+        text("SELECT ST_DWithin(CAST(:a AS geography), CAST(:b AS geography), 50000)"),
+        {"a": JAKARTA, "b": BOGOR},
+    )
+    assert within_50km is True
+
+
+async def test_database_is_migrated_to_head(db_session: AsyncSession) -> None:
+    head = ScriptDirectory.from_config(Config(BACKEND_DIR / "alembic.ini")).get_current_head()
+    current = await db_session.scalar(text("SELECT version_num FROM alembic_version"))
+    assert current == head
+
+
+async def test_db_session_changes_are_rolled_back_between_tests(db_session: AsyncSession) -> None:
+    # Paired with the test below: neither should see the other's table.
+    exists = await db_session.scalar(text("SELECT to_regclass('rollback_probe') IS NOT NULL"))
+    assert exists is False
+    await db_session.execute(text("CREATE TABLE rollback_probe (id int)"))
+    await db_session.commit()
+
+
+async def test_db_session_changes_are_rolled_back_between_tests_again(
+    db_session: AsyncSession,
+) -> None:
+    exists = await db_session.scalar(text("SELECT to_regclass('rollback_probe') IS NOT NULL"))
+    assert exists is False
+
+
+@pytest.fixture
+def scratch_database_url(integration_settings: IntegrationSettings) -> URL:
+    base = make_url(integration_settings.test_database_url)
+    return base.set(database=f"{base.database}_migrations")
+
+
+async def test_migrations_upgrade_downgrade_roundtrip(scratch_database_url: URL) -> None:
+    await recreate_database(scratch_database_url)
+    engine = create_async_engine(scratch_database_url)
+    query = text("SELECT count(*) FROM pg_extension WHERE extname = 'postgis'")
+    try:
+        await run_alembic(scratch_database_url, "upgrade", "head")
+        async with engine.connect() as connection:
+            assert await connection.scalar(query) == 1
+
+        await run_alembic(scratch_database_url, "downgrade", "base")
+        async with engine.connect() as connection:
+            assert await connection.scalar(query) == 0
+
+        await run_alembic(scratch_database_url, "upgrade", "head")
+        async with engine.connect() as connection:
+            assert await connection.scalar(query) == 1
+    finally:
+        await engine.dispose()
+        await drop_database(scratch_database_url)
