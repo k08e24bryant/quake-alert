@@ -396,6 +396,70 @@ async def test_same_feed_revision_with_moved_coordinates_updates_the_row(
     assert row.fingerprint == original.fingerprint
 
 
+async def test_same_datetime_in_one_feed_500_km_apart_is_two_quakes(
+    db_session: AsyncSession,
+) -> None:
+    # Polled separately (no shared snapshot), identical DateTime, ~500 km apart.
+    near_jayapura = make_report(Feed.GEMPATERKINI, latitude="-2.46", magnitude="5.0")
+    far_south = make_report(Feed.GEMPATERKINI, latitude="-6.96", magnitude="4.6")
+    assert near_jayapura.raw["DateTime"] == far_south.raw["DateTime"]
+
+    assert await upsert_all(db_session, near_jayapura, far_south) == [
+        UpsertOutcome.INSERTED,
+        UpsertOutcome.INSERTED,
+    ]
+    magnitudes = sorted((await db_session.scalars(select(Earthquake.magnitude))).all())
+    assert magnitudes == [Decimal("4.6"), Decimal("5.0")]
+
+
+@pytest.mark.parametrize(
+    ("label", "latitude", "expected"),
+    [
+        ("~89 km: revision", "-3.26", UpsertOutcome.UPDATED),
+        ("~111 km: different quake", "-3.46", UpsertOutcome.INSERTED),
+    ],
+)
+async def test_same_feed_revision_distance_guard_boundary(
+    db_session: AsyncSession, label: str, latitude: str, expected: UpsertOutcome
+) -> None:
+    await upsert_report(db_session, make_report(Feed.GEMPATERKINI), CONFIG)
+
+    outcome = await upsert_report(
+        db_session, make_report(Feed.GEMPATERKINI, latitude=latitude), CONFIG
+    )
+
+    assert outcome is expected, label
+
+
+async def test_same_feed_revision_distance_comes_from_config(db_session: AsyncSession) -> None:
+    tight = DedupConfig(
+        max_time_diff=timedelta(seconds=60),
+        max_distance_m=50_000,
+        shakemap_base_url=BASE_URL,
+        same_feed_revision_max_km=10,
+    )
+    original = make_report(Feed.GEMPATERKINI)
+    moved_25_km = make_report(Feed.GEMPATERKINI, latitude="-2.64", longitude="140.51")
+
+    await upsert_report(db_session, original, tight)
+    assert await upsert_report(db_session, moved_25_km, tight) is UpsertOutcome.INSERTED
+
+
+async def test_revision_distance_is_measured_from_the_same_feeds_previous_position(
+    db_session: AsyncSession,
+) -> None:
+    # Row location comes from autogempa; gempaterkini's own payload sits ~45 km north of it.
+    autogempa = make_report(Feed.AUTOGEMPA, latitude="-2.46")
+    terkini = make_report(Feed.GEMPATERKINI, latitude="-2.05")
+    await upsert_all(db_session, autogempa, terkini)
+    assert await count_rows(db_session) == 1
+
+    # ~95 km from gempaterkini's previous position (a revision), but ~140 km from the row.
+    revised_terkini = make_report(Feed.GEMPATERKINI, latitude="-1.20")
+    assert await upsert_report(db_session, revised_terkini, CONFIG) is UpsertOutcome.UPDATED
+    assert await count_rows(db_session) == 1
+
+
 async def test_cross_feed_near_duplicate_is_still_merged(db_session: AsyncSession) -> None:
     terkini = make_report(Feed.GEMPATERKINI)
     dirasakan = make_report(

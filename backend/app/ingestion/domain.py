@@ -1,4 +1,5 @@
 import hashlib
+import math
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import ROUND_HALF_UP, Decimal
@@ -6,6 +7,7 @@ from enum import StrEnum
 from typing import Any
 
 _TWO_PLACES = Decimal("0.01")
+_EARTH_MEAN_RADIUS_KM = 6371.0088
 
 
 class Feed(StrEnum):
@@ -52,3 +54,13 @@ def compute_fingerprint(occurred_at: datetime, latitude: Decimal, longitude: Dec
     lat = latitude.quantize(_TWO_PLACES, rounding=ROUND_HALF_UP)
     lon = longitude.quantize(_TWO_PLACES, rounding=ROUND_HALF_UP)
     return hashlib.sha256(f"{timestamp}|{lat}|{lon}".encode()).hexdigest()
+
+
+def distance_km(lat1: Decimal, lon1: Decimal, lat2: Decimal, lon2: Decimal) -> float:
+    """Great-circle (haversine) distance. Within ~0.5% of PostGIS geography distance, which is
+    plenty for a coarse guard like SAME_FEED_REVISION_MAX_KM."""
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    d_phi = phi2 - phi1
+    d_lambda = math.radians(lon2 - lon1)
+    a = math.sin(d_phi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(d_lambda / 2) ** 2
+    return 2 * _EARTH_MEAN_RADIUS_KM * math.asin(math.sqrt(a))

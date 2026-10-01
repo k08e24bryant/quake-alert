@@ -8,8 +8,10 @@ BMKG has no quake ID. A report from feed F resolves to an existing row by the fi
 that matches, and never to a row already `claimed` by another item of the same feed
 snapshot (items within one snapshot are always distinct quakes):
   1. Same-feed revision: the row holds an F payload with the identical DateTime (exact
-     second). Coordinates and other fields may have moved; it is the same quake. Several
-     candidates (only possible after a snapshot forced duplicates) -> the nearest one.
+     second) AND that payload's coordinates are within same_feed_revision_max_km of the
+     report. Coordinates and other fields may have moved; it is the same quake. Farther
+     away it is a different quake that happens to share the second. Several candidates
+     (only possible after a snapshot forced duplicates) -> the nearest one.
      DateTime is compared as BMKG's own string, so if BMKG ever changed its format, the
      comparison fails safe: a new row, never a wrong merge.
   2. Exact fingerprint (UTC time to the second + lat/lon rounded to 2 decimals), and
@@ -38,7 +40,7 @@ never on the order they were polled in):
 import hashlib
 import logging
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 from decimal import Decimal
@@ -52,8 +54,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
 from app.db.models import Earthquake
-from app.ingestion.domain import FEED_PRECEDENCE, QuakeReport
-from app.ingestion.parser import BmkgParseError, parse_item
+from app.ingestion.domain import FEED_PRECEDENCE, QuakeReport, distance_km
+from app.ingestion.parser import BmkgParseError, parse_coordinates, parse_item
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +78,7 @@ class DedupConfig:
     max_time_diff: timedelta
     max_distance_m: float
     shakemap_base_url: str  # needed to re-derive shakemap_url from raw payloads
+    same_feed_revision_max_km: float = 100.0
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "DedupConfig":
@@ -83,6 +86,7 @@ class DedupConfig:
             max_time_diff=timedelta(seconds=settings.dedup_max_time_diff_seconds),
             max_distance_m=settings.dedup_max_distance_km * 1000,
             shakemap_base_url=settings.bmkg_base_url,
+            same_feed_revision_max_km=settings.same_feed_revision_max_km,
         )
 
 
@@ -168,15 +172,16 @@ async def _find_match(
     unclaimed: ColumnElement[bool] = Earthquake.id.not_in(claimed) if claimed else true()
     no_payload_from_this_feed = ~Earthquake.raw.has_key(feed)
 
-    same_feed_revision = (
+    same_datetime_in_this_feed = (
         _select_match()
-        .where(
-            Earthquake.raw.contains({feed: {"DateTime": report.raw["DateTime"]}}),
-            unclaimed,
-        )
-        .order_by(func.ST_Distance(Earthquake.location, point), Earthquake.created_at)
-        .limit(1)
+        .where(Earthquake.raw.contains({feed: {"DateTime": report.raw["DateTime"]}}), unclaimed)
+        .order_by(Earthquake.created_at)
     )
+    candidates = (await session.execute(same_datetime_in_this_feed)).all()
+    revision = _nearest_same_feed_revision(candidates, report, config.same_feed_revision_max_km)
+    if revision is not None:
+        return revision
+
     same_fingerprint = _select_match().where(
         Earthquake.fingerprint == report.fingerprint, no_payload_from_this_feed, unclaimed
     )
@@ -195,11 +200,36 @@ async def _find_match(
         .order_by(seconds_apart, func.ST_Distance(Earthquake.location, point))
         .limit(1)
     )
-    for query in (same_feed_revision, same_fingerprint, nearby_from_other_feeds):
+    for query in (same_fingerprint, nearby_from_other_feeds):
         match = _to_match((await session.execute(query)).first())
         if match is not None:
             return match
     return None
+
+
+def _nearest_same_feed_revision(
+    candidates: Sequence[Any], report: QuakeReport, max_km: float
+) -> _Match | None:
+    """Among rows holding a payload from the report's feed with the same DateTime, the one
+    whose payload is nearest the report, if within max_km.
+
+    Distance is measured to that feed's own previous coordinates, not to the row's location,
+    which may come from a higher-precedence feed. A payload whose coordinates can't be read
+    is not treated as a match: unconfirmed means a new row, never a guess.
+    """
+    best: tuple[float, _Match] | None = None
+    for candidate in candidates:
+        match = _to_match(candidate)
+        if match is None:
+            continue
+        try:
+            lat, lon = parse_coordinates(match.row.raw[report.feed.value]["Coordinates"])
+        except (BmkgParseError, KeyError, TypeError, AttributeError):
+            continue
+        distance = distance_km(lat, lon, report.latitude, report.longitude)
+        if distance <= max_km and (best is None or distance < best[0]):
+            best = (distance, match)
+    return best[1] if best else None
 
 
 async def _insert(session: AsyncSession, report: QuakeReport, config: DedupConfig) -> uuid.UUID:

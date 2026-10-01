@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     # Two reports are the same quake if they are this close in time AND space.
     dedup_max_time_diff_seconds: int = Field(default=60, ge=0)
     dedup_max_distance_km: float = Field(default=50.0, ge=0)
+    # A same-feed report with an identical DateTime is a revision only if it is within this
+    # distance of that feed's previous coordinates; farther away it is a different quake.
+    same_feed_revision_max_km: float = Field(default=100.0, ge=0)
 
     # Retention for ingestion_runs. The latest successful run per feed is always kept,
     # because the content-hash skip compares against it.

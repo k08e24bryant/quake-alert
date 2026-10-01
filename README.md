@@ -40,7 +40,8 @@ Each poll works like this:
 4. **Deduplicate** (`app/ingestion/dedup.py`). BMKG has no quake ID. A report from feed F
    resolves to an existing row by the first rule that matches:
    1. **Same-feed revision:** the row already holds an F payload with the identical
-      `DateTime`. It is the same quake, even if coordinates or magnitude moved.
+      `DateTime`, **and** that payload's coordinates are within `SAME_FEED_REVISION_MAX_KM`
+      (100) of the report. It is the same quake, even if coordinates or magnitude moved.
    2. **Exact fingerprint** (UTC time to the second plus lat/lon rounded to 2 decimals),
       from another feed.
    3. **Fuzzy**, from another feed: within `DEDUP_MAX_TIME_DIFF_SECONDS` (60) **and**
@@ -97,10 +98,14 @@ ambiguous, dedup creates a new row:
   twice, so two items from one response never resolve to the same row, however close they
   are. Aftershock sequences are the case this protects, e.g. M5.8 then M5.1 thirty seconds
   later and 10 km away.
-- **Within a feed, `DateTime` is identity.** The same feed reporting the same second again
-  is a revision and gets merged, even if the coordinates moved. A different second from the
-  same feed is a different quake, even within 60 s and 50 km. A `DateTime` revision inside
-  one feed therefore produces a duplicate row. That cost is accepted.
+- **Within a feed, `DateTime` (plus a distance guard) is identity.** The same feed reporting
+  the same second again, within `SAME_FEED_REVISION_MAX_KM` (100 km) of its previous
+  position, is a revision and gets merged, even if the coordinates moved. The distance is
+  measured from that feed's own previous coordinates, not the row's location, which may come
+  from a higher-precedence feed. A different second from the same feed is a different
+  quake, even within 60 s and 50 km. So is the same second more than 100 km away, since two
+  unrelated quakes can share a second. A `DateTime` revision inside one feed therefore
+  produces a duplicate row. That cost is accepted.
 - **Fuzzy matching is only for reconciling different feeds.** Feeds describe the same quake
   with slightly different numbers. A row that already holds a payload from the incoming feed
   with a different `DateTime` is excluded, because that feed has already told us it is a
