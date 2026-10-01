@@ -1,28 +1,32 @@
-from typing import Any, ClassVar
+from typing import ClassVar
 
 from arq.connections import RedisSettings
-from arq.cron import CronJob
+from arq.cron import CronJob, cron
 from arq.typing import WorkerCoroutine
 
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
 from app.core.logging import logging_config
+from worker.jobs import poll_bmkg_feeds, shutdown, startup
 
-_settings = get_settings()
+_settings: Settings = get_settings()
 
 # arq's CLI applies its own plain-text logging; run it with
 # `--custom-log-dict worker.settings.LOGGING_CONFIG` to get structured JSON logs instead.
 LOGGING_CONFIG = logging_config(_settings.log_level)
 
 
-async def ping(ctx: dict[str, Any]) -> str:
-    """No-op job: arq refuses to start with zero registered functions.
-
-    Remove once the first real job is registered.
-    """
-    return "pong"
-
-
 class WorkerSettings:
-    functions: ClassVar[list[WorkerCoroutine]] = [ping]
-    cron_jobs: ClassVar[list[CronJob]] = []
+    functions: ClassVar[list[WorkerCoroutine]] = []
+    cron_jobs: ClassVar[list[CronJob]] = [
+        cron(
+            poll_bmkg_feeds,
+            second=0,  # every minute, on the minute
+            run_at_startup=True,
+            unique=True,  # never overlap with a slow previous poll
+            timeout=55,
+            max_tries=1,  # the next minute is the retry
+        )
+    ]
     redis_settings = RedisSettings.from_dsn(_settings.redis_url)
+    on_startup = startup
+    on_shutdown = shutdown
