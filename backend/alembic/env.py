@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import Mapping
 from logging.config import fileConfig
 from typing import Any
 
@@ -27,11 +28,21 @@ def _database_url() -> str:
     return config.get_main_option("sqlalchemy.url") or get_settings().database_url
 
 
+def include_name(name: str | None, type_: str, parent_names: Mapping[str, str | None]) -> bool:
+    # The postgis image installs postgis_topology and postgis_tiger_geocoder and puts their
+    # schemas on the search_path, so their tables look like ours. Autogenerate must only
+    # ever consider tables we model; anything else is owned by an extension.
+    if type_ == "table":
+        return name in target_metadata.tables
+    return True
+
+
 def _configure_kwargs() -> dict[str, Any]:
     # GeoAlchemy2 helpers keep PostGIS-managed objects (spatial_ref_sys, implicit spatial
     # indexes) out of autogenerate and render geometry/geography columns correctly.
     return {
         "target_metadata": target_metadata,
+        "include_name": include_name,
         "include_object": alembic_helpers.include_object,
         "process_revision_directives": alembic_helpers.writer,
         "render_item": alembic_helpers.render_item,

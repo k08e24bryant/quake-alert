@@ -9,7 +9,13 @@ from httpx import ASGITransport, AsyncClient
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from redis.asyncio import Redis
 from sqlalchemy import URL, make_url, text
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncConnection,
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from app.core.config import Settings
 from app.main import create_app
@@ -58,9 +64,9 @@ async def drop_database(url: URL) -> None:
         await admin.dispose()
 
 
-async def run_alembic(database_url: URL, action: str, revision: str) -> None:
+async def run_alembic(database_url: URL, action: str, *args: str) -> None:
     # env.py calls asyncio.run(), which cannot nest inside the test event loop.
-    await asyncio.to_thread(getattr(command, action), alembic_config(database_url), revision)
+    await asyncio.to_thread(getattr(command, action), alembic_config(database_url), *args)
 
 
 @pytest.fixture(scope="session")
@@ -86,22 +92,34 @@ async def engine(database_url: URL) -> AsyncIterator[AsyncEngine]:
 
 
 @pytest.fixture
-async def db_session(engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
-    """A session inside a transaction that is rolled back after the test.
-
-    Code under test may call commit(); with create_savepoint it only releases a SAVEPOINT,
-    so nothing leaks between tests.
-    """
+async def db_connection(engine: AsyncEngine) -> AsyncIterator[AsyncConnection]:
+    """A connection inside a transaction that is rolled back after the test."""
     async with engine.connect() as connection:
         transaction = await connection.begin()
-        session = AsyncSession(
-            bind=connection, join_transaction_mode="create_savepoint", expire_on_commit=False
-        )
         try:
-            yield session
+            yield connection
         finally:
-            await session.close()
             await transaction.rollback()
+
+
+@pytest.fixture
+def session_factory(db_connection: AsyncConnection) -> async_sessionmaker[AsyncSession]:
+    """Sessions bound to the test transaction, for code that opens its own sessions.
+
+    Code under test may begin/commit freely; with create_savepoint that only creates and
+    releases SAVEPOINTs, so nothing leaks between tests.
+    """
+    return async_sessionmaker(
+        bind=db_connection, join_transaction_mode="create_savepoint", expire_on_commit=False
+    )
+
+
+@pytest.fixture
+async def db_session(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> AsyncIterator[AsyncSession]:
+    async with session_factory() as session:
+        yield session
 
 
 @pytest.fixture
