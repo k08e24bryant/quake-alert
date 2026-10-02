@@ -8,9 +8,11 @@ __pycache__/
 .coverage
 htmlcov/
 
-# Env
+# Env: .env and any variant (e.g. deploy/.env.production), but keep the examples
 .env
+.env.*
 !.env.example
+!.env*.example
 
 # Editors / OS
 .vscode/
@@ -28,3 +30,10 @@ frontend/next-env.d.ts
 frontend/*.tsbuildinfo
 frontend/.env*.local
 frontend/.env
+
+# Database dumps (deploy/backup.sh): contain subscribers' locations and chat ids
+*.sql
+*.sql.gz
+
+# Vercel CLI (vercel link)
+.vercel/
