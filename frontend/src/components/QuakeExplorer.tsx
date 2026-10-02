@@ -8,6 +8,7 @@ import type { UserArea } from "@/components/QuakeMap";
 import { api, errorMessage, listUpTo } from "@/lib/api";
 import { formatDistance, formatMagnitude, formatWib } from "@/lib/format";
 import { geolocationErrorMessage, roundCoordinate } from "@/lib/geo";
+import { select, type Selection } from "@/lib/selection";
 import type { Earthquake } from "@/lib/types";
 
 // Leaflet needs `window`: the map is rendered in the browser only.
@@ -51,10 +52,10 @@ export function QuakeExplorer() {
   const [attempt, setAttempt] = useState(0);
   const requestKey = JSON.stringify([minMag, rangeDays, position, nearbyRadius, attempt]);
   const [result, setResult] = useState<Keyed<Load> | null>(null);
-  const [selected, setSelected] = useState<Keyed<string> | null>(null);
+  const [selected, setSelected] = useState<Keyed<Selection> | null>(null);
 
   const load: Load = result?.key === requestKey ? result.value : { state: "loading" };
-  const selectedId = selected?.key === requestKey ? selected.value : null;
+  const selection = selected?.key === requestKey ? selected.value : null;
   const userArea: UserArea | null = useMemo(
     () => (position ? { ...position, radiusKm: nearbyRadius } : null),
     [position, nearbyRadius],
@@ -201,7 +202,7 @@ export function QuakeExplorer() {
       ) : (
         <>
           <div id="peta-gempa">
-            <QuakeMap quakes={load.quakes} selectedId={selectedId} userArea={userArea} />
+            <QuakeMap quakes={load.quakes} selection={selection} userArea={userArea} />
           </div>
           <MagnitudeLegend />
           {load.quakes.length > 0 && (
@@ -224,7 +225,7 @@ export function QuakeExplorer() {
                       type="button"
                       className="button button-small"
                       onClick={() => {
-                        setSelected({ key: requestKey, value: quake.id });
+                        setSelected({ key: requestKey, value: select(selection, quake.id) });
                         document.getElementById("peta-gempa")?.scrollIntoView({ block: "center" });
                       }}
                     >

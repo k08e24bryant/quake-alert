@@ -25,6 +25,7 @@ import {
   OSM_TILES,
   POINT_STYLE,
 } from "@/lib/mapConfig";
+import type { Selection } from "@/lib/selection";
 import type { Earthquake } from "@/lib/types";
 
 export interface UserArea {
@@ -35,11 +36,11 @@ export interface UserArea {
 
 interface QuakeMapProps {
   quakes: Earthquake[];
-  selectedId: string | null;
+  selection: Selection | null;
   userArea: UserArea | null;
 }
 
-export default function QuakeMap({ quakes, selectedId, userArea }: QuakeMapProps) {
+export default function QuakeMap({ quakes, selection, userArea }: QuakeMapProps) {
   const markers = useRef(new Map<string, LeafletCircleMarker>());
   // Bigger quakes underneath, so small ones stay clickable.
   const ordered = [...quakes].sort((a, b) => b.magnitude - a.magnitude);
@@ -97,7 +98,7 @@ export default function QuakeMap({ quakes, selectedId, userArea }: QuakeMapProps
           </CircleMarker>
         ))}
         <FitView userArea={userArea} />
-        <FocusSelected selectedId={selectedId} markers={markers} />
+        <FocusSelected selection={selection} markers={markers} />
       </MapContainer>
     </div>
   );
@@ -126,19 +127,21 @@ function FitView({ userArea }: { userArea: UserArea | null }) {
 
 /** "Tampilkan di peta" from the list: centre the marker and open its popup. */
 function FocusSelected({
-  selectedId,
+  selection,
   markers,
 }: {
-  selectedId: string | null;
+  selection: Selection | null;
   markers: RefObject<Map<string, LeafletCircleMarker>>;
 }) {
   const map = useMap();
+  // Runs for every new selection (a new seq), not only a new id: clicking the same quake
+  // again reopens its popup after the user closed it.
   useEffect(() => {
-    if (!selectedId) return;
-    const marker = markers.current.get(selectedId);
+    if (!selection) return;
+    const marker = markers.current.get(selection.id);
     if (!marker) return;
     map.setView(marker.getLatLng(), Math.max(map.getZoom(), 7));
     marker.openPopup();
-  }, [map, markers, selectedId]);
+  }, [map, markers, selection]);
   return null;
 }
