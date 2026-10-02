@@ -14,19 +14,48 @@ In English: this service is unofficial and only forwards BMKG data; notification
 late or not arrive; for official information and safety guidance, follow BMKG and the local
 disaster agency (BPBD).
 
-## Live
+Not hosted publicly; production deploy files and a rehearsed deploy are in [docs/deploy.md](docs/deploy.md).
 
-| | |
-|---|---|
-| Website | <https://gempasekitarsaya.my.id> |
-| API | <https://api.gempasekitarsaya.my.id> (OpenAPI docs at [`/docs`](https://api.gempasekitarsaya.my.id/docs), freshness at [`/v1/status`](https://api.gempasekitarsaya.my.id/v1/status)) |
-| Telegram bot | [@infogempasekitarbot](https://t.me/infogempasekitarbot) |
+## Highlights
 
-_These go live with the first production deploy ([docs/deploy.md](docs/deploy.md))._
+- **Dedup that prefers duplicates over wrong merges.** BMKG has no quake ID, and a wrong
+  merge would be a missed alert. [Why and how](#dedup-prefers-duplicates-over-wrong-merges).
+- **Exactly-once alert matching** through a transactional outbox, even when a queued job
+  is lost. [From a new quake to a message](#from-a-new-quake-to-a-message).
+- **SSRF-safe signed webhooks**: connect to the vetted IP (no DNS rebinding), with no
+  redirects, and verify ownership before any alert.
+  [Details](#webhooks-connect-to-the-ip-that-was-checked).
+- **Redis is optional for the API**: a circuit breaker, reads that fail open and
+  subscription writes that fail closed.
+  [Details](#for-the-api-redis-is-an-optimisation-the-worker-needs-it).
+- **Staleness is shown, never hidden**: `/v1/status`, `data_as_of` on every response,
+  and a banner on the site. [Details](#staleness-is-exposed-not-a-readiness-failure).
+
+## Screenshots
+
+![Map of recent quakes, markers sized and coloured by magnitude, with the data freshness line above](docs/screenshots/map.png)
+*Map of recent quakes from BMKG data, sized and coloured by magnitude, with how fresh the
+data is shown above it.*
+
+![Quake details popup](docs/screenshots/popup.png)
+*Quake details: magnitude, region, depth, local time (UTC+7), and BMKG's own statement
+shown verbatim, with its source feeds.*
+
+![History table with filters and a Load more button](docs/screenshots/history.png)
+*History: magnitude, date-range and radius filters, paged with the API's cursor.*
+
+<p>
+  <img src="docs/screenshots/mobile.png" alt="The map page on a narrow phone screen" width="300">
+  &nbsp;
+  <img src="docs/screenshots/telegram.jpeg" alt="An alert message in Telegram" width="300">
+</p>
+
+*Left: the mobile layout at 380 px. Right: a Telegram alert, with the source attribution
+and the disclaimer.*
 
 ## Contents
 
-- [Architecture](#architecture) · [Screenshots](#screenshots) ·
+- [Highlights](#highlights) · [Screenshots](#screenshots) · [Architecture](#architecture) ·
   [Quick start](#quick-start) · [Tests](#tests) · [Design decisions](#design-decisions-at-a-glance) ·
   [Deployment](#deployment)
 - How it works: [Ingestion](#ingestion) · [Query API](#query-api) ·
@@ -42,17 +71,15 @@ flowchart LR
     browser["Browser"]
     telegram["Telegram"]
     receivers["Webhook receivers"]
-    bmkg["BMKG Open Data<br/>autogempa, gempaterkini,<br/>gempadirasakan"]
+    bmkg["BMKG"]
   end
-  subgraph vercel["Vercel"]
-    frontend["Frontend (Next.js)<br/>gempasekitarsaya.my.id"]
-  end
-  subgraph vm["Oracle Cloud A1 VM, arm64"]
-    caddy["Caddy: HTTPS<br/>api.gempasekitarsaya.my.id"]
-    api["API (FastAPI)"]
-    worker["Worker (arq)"]
+  frontend["Vercel frontend"]
+  subgraph vm["Linux VM (Docker Compose)"]
+    caddy["Caddy"]
+    api["api"]
+    worker["worker"]
     subgraph internal["internal network, no published ports"]
-      db[("PostgreSQL + PostGIS")]
+      db[("PostgreSQL+PostGIS")]
       redis[("Redis")]
     end
   end
@@ -79,13 +106,6 @@ flowchart LR
   its origins.
 - **Only Caddy is reachable** from the internet (80, 443). PostgreSQL and Redis sit on an
   internal network with no published port.
-
-## Screenshots
-
-<!-- Replace with real captures after the first deploy (docs/screenshots/). -->
-| Peta, 380 px, light | Riwayat, desktop, dark | Telegram alert |
-|---|---|---|
-| _to add: `docs/screenshots/peta-mobile.png`_ | _to add: `docs/screenshots/riwayat-dark.png`_ | _to add: `docs/screenshots/telegram-alert.png`_ |
 
 ## Quick start
 
