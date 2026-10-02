@@ -1,0 +1,168 @@
+# Production stack on one VM (Oracle Cloud Ampere A1, linux/arm64). See docs/deploy.md.
+#
+#   cd /opt/quake-alert/deploy
+#   cp .env.production.example .env      # then fill it in; .env is gitignored
+#   ./deploy.sh                          # pull images, migrate, start, wait for /readyz
+#
+# Only Caddy publishes ports (80, 443). PostgreSQL and Redis live on an internal network
+# with no route to the outside and no published port. Images come from GHCR, built for
+# arm64 and amd64 by CI (.github/workflows/ci.yml).
+
+name: quake-alert-prod
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+x-backend: &backend
+  image: ghcr.io/k08e24bryant/quake-alert-api:${IMAGE_TAG:-latest}
+  restart: unless-stopped
+  logging: *logging
+  env_file:
+    - path: .env
+      required: true
+  environment: &backend-env
+    ENVIRONMENT: production
+    # Built from the same variables the db and redis services use, so they can't disagree.
+    # Generate the passwords as hex (see .env.production.example): they go into URLs.
+    DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:?set POSTGRES_USER in deploy/.env}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env}@db:5432/${POSTGRES_DB:?set POSTGRES_DB in deploy/.env}
+    REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in deploy/.env}@redis:6379/0
+    # Caddy is the only way in, and it sets X-Forwarded-For.
+    TRUST_PROXY_HEADERS: "true"
+
+services:
+  db:
+    # postgis/postgis is amd64-only: this is postgres:16 + PostGIS 3 (deploy/postgis).
+    image: ghcr.io/k08e24bryant/quake-alert-postgis:${POSTGIS_IMAGE_TAG:-latest}
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks: [internal]
+    shm_size: 256mb
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      # Lets redis-cli in the healthcheck authenticate without the password on its command line.
+      REDISCLI_AUTH: ${REDIS_PASSWORD}
+    # The password goes into a config file, not onto the command line (visible in `ps`).
+    # AOF on: the arq queue (pending jobs and retries) survives a restart.
+    command:
+      - sh
+      - -c
+      - |
+        printf 'requirepass %s\n' "$$REDIS_PASSWORD" > /tmp/redis.conf
+        exec redis-server /tmp/redis.conf --appendonly yes --appendfsync everysec
+    volumes:
+      - redisdata:/data
+    networks: [internal]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # One-off: `./deploy.sh` runs it after db is healthy and before api/worker are
+  # (re)started. Not started by a plain `up` (profile).
+  migrate:
+    <<: *backend
+    restart: "no"
+    profiles: [deploy]
+    command: ["alembic", "upgrade", "head"]
+    networks: [internal]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  api:
+    <<: *backend
+    # The image's CMD: uvicorn with --no-access-log (app/core/access_log.py logs requests
+    # without query strings).
+    networks: [internal, egress]  # egress: webhook verification and test requests
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8000/readyz', timeout=3)"
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  worker:
+    <<: *backend
+    command:
+      - arq
+      - worker.settings.WorkerSettings
+      - --custom-log-dict
+      - worker.settings.LOGGING_CONFIG
+    networks: [internal, egress]  # egress: BMKG, Telegram, webhooks
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # Passes while the worker refreshes its health key in Redis (every 60 s).
+      test: ["CMD", "arq", "--check", "worker.settings.WorkerSettings"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 90s
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    logging: *logging
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      API_DOMAIN: ${API_DOMAIN:?set API_DOMAIN in deploy/.env}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in deploy/.env}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data  # certificates: keep it, or Let's Encrypt rate limits bite
+      - caddy_config:/config
+    networks: [egress]
+    depends_on:
+      - api
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:2019/config/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+networks:
+  # No route out, no published ports: db and redis are reachable only from api/worker.
+  internal:
+    internal: true
+  egress: {}
+
+volumes:
+  pgdata:
+  redisdata:
+  caddy_data:
+  caddy_config:

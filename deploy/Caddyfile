@@ -1,0 +1,55 @@
+# Caddy in front of the API: automatic HTTPS (Let's Encrypt) for API_DOMAIN, reverse proxy
+# to the api container. See docs/deploy.md.
+#
+# Location privacy (README, "Location privacy"): there is NO access log (no `log` directive
+# in the site block), and the default logger, which still carries error records that can
+# include the request, drops the query string, the client address and credentials from
+# every record. The API's own access log never has the query string either.
+{
+	email {$ACME_EMAIL}
+
+	log default {
+		output stdout
+		format filter {
+			wrap json
+			fields {
+				request>uri regexp \?.* ""
+				request>remote_ip delete
+				request>remote_port delete
+				request>client_ip delete
+				request>headers>X-Forwarded-For delete
+				request>headers>Authorization delete
+				request>headers>Cookie delete
+				request>headers>X-Telegram-Bot-Api-Secret-Token delete
+			}
+		}
+	}
+
+	servers {
+		# HTTP/1.1 and HTTP/2 over TCP only: no UDP port to open for HTTP/3.
+		protocols h1 h2
+	}
+}
+
+{$API_DOMAIN} {
+	encode zstd gzip
+
+	# The API's largest request is a Telegram update or a subscription: tiny.
+	request_body {
+		max_size 1MB
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	# Caddy replaces any client-sent X-Forwarded-For with the real client address, which the
+	# API reads (TRUST_PROXY_HEADERS=true, last entry) for rate limiting.
+	reverse_proxy api:8000 {
+		health_uri /healthz
+		health_interval 30s
+	}
+}

@@ -14,6 +14,130 @@ In English: this service is unofficial and only forwards BMKG data; notification
 late or not arrive; for official information and safety guidance, follow BMKG and the local
 disaster agency (BPBD).
 
+## Live
+
+| | |
+|---|---|
+| Website | <https://gempasekitarsaya.my.id> |
+| API | <https://api.gempasekitarsaya.my.id> (OpenAPI docs at [`/docs`](https://api.gempasekitarsaya.my.id/docs), freshness at [`/v1/status`](https://api.gempasekitarsaya.my.id/v1/status)) |
+| Telegram bot | [@infogempasekitarbot](https://t.me/infogempasekitarbot) |
+
+_These go live with the first production deploy ([docs/deploy.md](docs/deploy.md))._
+
+## Contents
+
+- [Architecture](#architecture) · [Screenshots](#screenshots) ·
+  [Quick start](#quick-start) · [Tests](#tests) · [Design decisions](#design-decisions-at-a-glance) ·
+  [Deployment](#deployment)
+- How it works: [Ingestion](#ingestion) · [Query API](#query-api) ·
+  [Ingestion freshness](#ingestion-freshness) · [Telegram](#notifications-telegram) ·
+  [Webhooks](#notifications-webhooks) ([receiver guide](docs/webhooks.md)) · [Frontend](#frontend)
+- [Design decisions in depth](#design-decisions) · [Development](#development)
+
+## Architecture
+
+```mermaid
+flowchart LR
+  subgraph outside["Internet"]
+    browser["Browser"]
+    telegram["Telegram"]
+    receivers["Webhook receivers"]
+    bmkg["BMKG Open Data<br/>autogempa, gempaterkini,<br/>gempadirasakan"]
+  end
+  subgraph vercel["Vercel"]
+    frontend["Frontend (Next.js)<br/>gempasekitarsaya.my.id"]
+  end
+  subgraph vm["Oracle Cloud A1 VM, arm64"]
+    caddy["Caddy: HTTPS<br/>api.gempasekitarsaya.my.id"]
+    api["API (FastAPI)"]
+    worker["Worker (arq)"]
+    subgraph internal["internal network, no published ports"]
+      db[("PostgreSQL + PostGIS")]
+      redis[("Redis")]
+    end
+  end
+  browser -- "pages" --> frontend
+  browser -- "GET /v1/* (CORS)" --> caddy
+  telegram -- "POST /v1/telegram/webhook" --> caddy
+  caddy --> api
+  api --> db
+  api -- "cache, rate limits, jobs" --> redis
+  worker -- "poll every minute" --> bmkg
+  worker -- "dedup, outbox, deliveries" --> db
+  worker -- "queue" --> redis
+  worker -- "alerts" --> telegram
+  worker -- "signed POST" --> receivers
+```
+
+- **The worker** polls BMKG every minute and deduplicates quakes into PostGIS. It matches
+  them to subscriptions through a transactional outbox and delivers alerts (Telegram, signed
+  webhooks) as retried arq jobs.
+- **The API** serves the stored history, nearby quakes (PostGIS), freshness and
+  subscriptions. Redis is an optimisation for it (cache, rate limits), never a dependency of
+  correctness.
+- **The frontend** is static on Vercel and reads the API from the browser; CORS allows only
+  its origins.
+- **Only Caddy is reachable** from the internet (80, 443). PostgreSQL and Redis sit on an
+  internal network with no published port.
+
+## Screenshots
+
+<!-- Replace with real captures after the first deploy (docs/screenshots/). -->
+| Peta, 380 px, light | Riwayat, desktop, dark | Telegram alert |
+|---|---|---|
+| _to add: `docs/screenshots/peta-mobile.png`_ | _to add: `docs/screenshots/riwayat-dark.png`_ | _to add: `docs/screenshots/telegram-alert.png`_ |
+
+## Quick start
+
+Requirements: Docker, [uv](https://docs.astral.sh/uv/), Node.js 20.9+.
+
+```sh
+cp backend/.env.example backend/.env          # dev settings; CORS allows http://localhost:3000
+docker compose up --build                     # PostGIS, Redis, API on :8000, worker
+cd frontend && cp .env.example .env.local && npm install && npm run dev   # :3000
+```
+
+The worker starts filling the database from BMKG within a minute: `curl
+localhost:8000/v1/status`. Details, including the Telegram bot in polling mode and a
+synthetic test quake: [Development](#development).
+
+## Tests
+
+| Suite | Command | What |
+|---|---|---|
+| Backend | `cd backend && uv run pytest` | Unit and integration tests against a **real PostGIS and Redis** (no database mocks): dedup, matching, delivery, SSRF, rate limits, CORS, access log privacy, startup checks |
+| Backend static | `uv run ruff check . && uv run ruff format --check . && uv run mypy` | Lint, format, strict typing |
+| Frontend | `cd frontend && npm run lint && npm run typecheck && npm test` | ESLint, `tsc` (strict), vitest |
+| Deploy | `shellcheck -x deploy/*.sh`; `docker compose -f deploy/docker-compose.prod.yml config` | Scripts and production compose file |
+
+CI runs all of them on every push, then builds the arm64 and amd64 images on `main`.
+Details: [Backend checks](#backend-checks), [Frontend checks](#checks).
+
+## Design decisions at a glance
+
+- [Dedup prefers duplicates over wrong merges](#dedup-prefers-duplicates-over-wrong-merges):
+  a wrong merge is a missed alert, a duplicate at most a duplicate alert.
+- [Transactional outbox for alerts](#from-a-new-quake-to-a-message): exactly-once matching,
+  even when a job is lost.
+- [Staleness is exposed, not a readiness failure](#staleness-is-exposed-not-a-readiness-failure).
+- [For the API, Redis is an optimisation; the worker needs it](#for-the-api-redis-is-an-optimisation-the-worker-needs-it),
+  with a circuit breaker and fail-open reads.
+- [Webhook writes fail closed](#notifications-webhooks), reads fail open.
+- [Webhooks connect to the IP that was checked](#webhooks-connect-to-the-ip-that-was-checked)
+  (SSRF and DNS rebinding), with ownership verification before any alert.
+- [A wrong manage token answers 404, not 403](#a-wrong-manage-token-answers-404-not-403).
+- [Fixed-window rate limiting](#fixed-window-rate-limiting-allows-bursts-at-window-edges)
+  and its edge bursts.
+- [Location privacy](#frontend): the visitor's location is rounded, never stored, and never
+  logged by the API or Caddy.
+
+## Deployment
+
+One Oracle Cloud Always Free Ampere A1 VM (arm64) runs Caddy, the API, the worker,
+PostgreSQL + PostGIS and Redis with `deploy/docker-compose.prod.yml`; the frontend runs on
+Vercel. CI publishes multi-arch images to GHCR. Step by step, from a fresh VM to monitoring:
+**[docs/deploy.md](docs/deploy.md)**.
+
 ## Ingestion
 
 The worker runs `poll_bmkg_feeds` every minute, on the minute, and once at startup. It
@@ -550,10 +674,7 @@ data honestly.
 | **Riwayat** (`/riwayat`) | A table with magnitude, WIB date range and an optional radius around a point (click the map or type coordinates). "Muat lebih banyak" follows the API's `next_cursor`; there are no page numbers. |
 | **Cara berlangganan** (`/cara-berlangganan`) | The Telegram bot link and commands, and the webhook flow (create, store the secret, verify) with a link to `docs/webhooks.md`. |
 
-<!-- Screenshots: replace with real captures once deployed. -->
-| Peta (380 px, light) | Riwayat (desktop, dark) |
-|---|---|
-| _screenshot: docs/screenshots/peta-mobile.png_ | _screenshot: docs/screenshots/riwayat-dark.png_ |
+Screenshots: [above](#screenshots).
 
 **On every page:**
 - "Data terakhir diperbarui X menit lalu", from `GET /v1/status` (refreshed every minute).
@@ -587,8 +708,10 @@ query parameters of the API request. Nothing is stored in the browser. On the se
   log line, of any logger, contains them or a query string. `tests/unit/test_logging.py`
   checks that uvicorn's access logger emits nothing.
 - The list cache keys on the rounded parameters for 30 s, in Redis only.
-- A reverse proxy in front of the API (e.g. Caddy) keeps its own access log; configure it
-  not to log query strings too.
+- Caddy in production (`deploy/Caddyfile`) writes **no access log**. Its error log can carry
+  the request, so a log filter drops the query string, the client address and credentials
+  from every record. That was verified by sending `?lat=…&lon=…` through Caddy to a missing
+  upstream: the logged `uri` was the bare path.
 
 **Leaflet runs in the browser only** (`next/dynamic` with `ssr: false`): it needs `window`.
 The Riwayat explorer is browser-only too, because its default range ("the last 30 days")
@@ -808,7 +931,7 @@ docker compose up --build
 
 | Service  | What it does                                                      |
 |----------|-------------------------------------------------------------------|
-| `db`     | PostgreSQL 16 + PostGIS 3.5 (`postgis/postgis:16-3.5`)            |
+| `db`     | PostgreSQL 16 + PostGIS 3.5 (`postgis/postgis:16-3.5`, amd64; production uses `deploy/postgis` for arm64) |
 | `redis`  | Redis 7: arq job queue                                            |
 | `api`    | Runs `alembic upgrade head`, then FastAPI with auto-reload on :8000 |
 | `worker` | arq worker (`worker.settings.WorkerSettings`)                     |
@@ -887,4 +1010,7 @@ uv run alembic upgrade head
 ```
 
 CI (`.github/workflows/ci.yml`) runs ruff, mypy and pytest against PostGIS and Redis
-service containers.
+service containers, the frontend's lint, typecheck and tests, and shellcheck plus a
+`docker compose config` of the production file. On `main`, once all of that passes, it
+builds `quake-alert-api` and `quake-alert-postgis` for linux/arm64 and linux/amd64 and
+pushes them to GHCR ([docs/deploy.md](docs/deploy.md), step 1).
