@@ -26,4 +26,6 @@ RUN useradd --system --uid 1000 --no-create-home app
 USER app
 
 EXPOSE 8000
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# uvicorn's access log has full URLs (query strings can hold a location); app/core/access_log.py
+# replaces it.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]

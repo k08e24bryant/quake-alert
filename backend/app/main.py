@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from app.api import earthquakes, health, status, subscriptions, telegram
+from app.core.access_log import AccessLogMiddleware
 from app.core.circuit_breaker import CircuitBreaker
 from app.core.config import Settings, get_settings
 from app.core.cors import ReadApiCORSMiddleware, cors_origins
@@ -67,6 +68,8 @@ def create_app(
     origins = cors_origins(app_settings)
     if origins:
         app.add_middleware(ReadApiCORSMiddleware, allow_origins=origins)
+    # Added last, so it is outermost: it times and logs every response, preflights included.
+    app.add_middleware(AccessLogMiddleware)
     app.include_router(health.router)
     app.include_router(earthquakes.router)
     app.include_router(status.router)

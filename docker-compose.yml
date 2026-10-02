@@ -55,7 +55,8 @@ services:
   api:
     <<: *backend
     # Migrate, then serve. Polling is needed for reload to see edits made on a Windows/macOS host.
-    command: sh -c "alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir app"
+    # --no-access-log: app/core/access_log.py replaces it (no query strings, which can hold a location).
+    command: sh -c "alembic upgrade head && exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --no-access-log --reload --reload-dir app"
     environment:
       <<: *backend-env
       WATCHFILES_FORCE_POLLING: "true"

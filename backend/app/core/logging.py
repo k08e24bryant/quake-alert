@@ -8,7 +8,10 @@ from typing import Any
 _RESERVED_ATTRS = frozenset(vars(logging.makeLogRecord({}))) | {"message", "asctime"}
 
 # Libraries that install their own plain-text handlers; route them through ours instead.
-_THIRD_PARTY_LOGGERS = ("uvicorn", "uvicorn.error", "uvicorn.access", "arq")
+_THIRD_PARTY_LOGGERS = ("uvicorn", "uvicorn.error", "arq")
+
+# Above CRITICAL: nothing logged here is ever emitted.
+_OFF = logging.CRITICAL + 10
 
 
 class JsonFormatter(logging.Formatter):
@@ -46,6 +49,9 @@ def logging_config(level: str) -> dict[str, Any]:
                 name: {"handlers": [], "propagate": True, "level": level}
                 for name in _THIRD_PARTY_LOGGERS
             },
+            # uvicorn's access log has the full URL (query string included, which can hold
+            # a visitor's location) and the client address. app.core.access_log replaces it.
+            "uvicorn.access": {"handlers": [], "propagate": False, "level": _OFF},
             # httpx logs every request at INFO; with a poll per feed per minute that is noise.
             "httpx": {"level": "WARNING"},
         },

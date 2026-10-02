@@ -573,8 +573,22 @@ data honestly.
 
 **Location privacy.** "Gempa di sekitar saya" asks for the location only when clicked. The
 position is rounded to 2 decimals (about 1 km), kept in memory, and sent only as `lat`/`lon`
-query parameters of the API request. Nothing is stored in the browser. On the server, the
-list cache keys on the rounded parameters for 30 s.
+query parameters of the API request. Nothing is stored in the browser. On the server:
+- **The location is never logged.** uvicorn's access log (full URL with the query string,
+  plus the client address) is off: `--no-access-log` in `docker-compose.yml` and the
+  `Dockerfile`, and silenced in `app/core/logging.py` in case uvicorn is started without
+  the flag. `app/core/access_log.py` replaces it with one JSON line per request with
+  `method`, `path` (never the query string), `status` and `duration_ms`. It has no query, no
+  client IP and no headers.
+  ```json
+  {"level": "INFO", "logger": "app.access", "message": "request", "method": "GET", "path": "/v1/earthquakes", "status": 200, "duration_ms": 45.0}
+  ```
+  `tests/integration/test_access_log.py` sends a request with `lat`/`lon` and checks that no
+  log line, of any logger, contains them or a query string. `tests/unit/test_logging.py`
+  checks that uvicorn's access logger emits nothing.
+- The list cache keys on the rounded parameters for 30 s, in Redis only.
+- A reverse proxy in front of the API (e.g. Caddy) keeps its own access log; configure it
+  not to log query strings too.
 
 **Leaflet runs in the browser only** (`next/dynamic` with `ssr: false`): it needs `window`.
 The Riwayat explorer is browser-only too, because its default range ("the last 30 days")
