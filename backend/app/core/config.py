@@ -1,8 +1,11 @@
+import re
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+_TELEGRAM_SECRET = re.compile(r"[A-Za-z0-9_-]{1,256}")
 
 
 class Settings(BaseSettings):
@@ -103,6 +106,15 @@ class Settings(BaseSettings):
 
     # Daily prune: sent/failed deliveries older than this are deleted; pending never are.
     notification_deliveries_retention_days: int = Field(default=30, ge=1)
+
+    @field_validator("telegram_webhook_secret")
+    @classmethod
+    def _telegram_secret_format(cls, value: SecretStr) -> SecretStr:
+        # What setWebhook accepts as secret_token; anything else would be refused there.
+        secret = value.get_secret_value()
+        if secret and not _TELEGRAM_SECRET.fullmatch(secret):
+            raise ValueError("TELEGRAM_WEBHOOK_SECRET must be 1-256 characters of A-Z a-z 0-9 _ -")
+        return value
 
 
 @lru_cache

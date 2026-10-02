@@ -9,10 +9,10 @@ from app.core.access_log import AccessLogMiddleware
 from app.core.circuit_breaker import CircuitBreaker
 from app.core.config import Settings, get_settings
 from app.core.cors import ReadApiCORSMiddleware, cors_origins
-from app.core.crypto import check_startup_secrets
 from app.core.logging import configure_logging
 from app.core.rate_limit import RateLimiter
 from app.core.redis import GuardedRedis, create_redis
+from app.core.startup import check_startup_settings
 from app.db.session import create_engine, create_sessionmaker
 from app.notifications.webhook import WebhookNotifier, create_webhook_http_client
 
@@ -27,7 +27,7 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         configure_logging(app_settings.log_level)
-        check_startup_secrets(app_settings)  # e.g. no WEBHOOK_SECRET_KEYS in production
+        check_startup_settings(app_settings)  # production: every required setting, valid keys
         engine = create_engine(app_settings)
         redis = create_redis(app_settings.redis_url, app_settings.redis_socket_timeout_seconds)
         app.state.settings = app_settings

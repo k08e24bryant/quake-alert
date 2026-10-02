@@ -9,7 +9,7 @@ from arq import ArqRedis, Retry
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from app.core.config import Settings, get_settings
-from app.core.crypto import check_startup_secrets
+from app.core.startup import check_startup_settings
 from app.db.session import create_engine, create_sessionmaker
 from app.earthquakes.cache import invalidate_latest
 from app.ingestion.bmkg_client import BmkgClient, create_http_client
@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 async def startup(ctx: dict[str, Any]) -> None:
     settings = get_settings()
-    check_startup_secrets(settings)  # e.g. no WEBHOOK_SECRET_KEYS in production
+    check_startup_settings(settings)  # production: every required setting, valid keys
     engine = create_engine(settings)
     http = create_http_client(settings)
     ctx["settings"] = settings

@@ -352,11 +352,16 @@ async def test_production_refuses_to_start_without_webhook_keys(
     database_url: DatabaseURL, integration_settings: IntegrationSettings
 ) -> None:
     def production(keys: str) -> Settings:
+        # Every other required production setting is present (see app.core.startup).
         return Settings(
             environment="production",
             database_url=database_url.render_as_string(hide_password=False),
             redis_url=integration_settings.test_redis_url,
             webhook_secret_keys=SecretStr(keys),
+            telegram_bot_token=SecretStr("123456:prod-token"),
+            telegram_webhook_secret=SecretStr("prod-webhook-secret"),
+            cors_allowed_origins="https://gempasekitarsaya.my.id",
+            trust_proxy_headers=True,
         )
 
     without_keys = create_app(production(""))

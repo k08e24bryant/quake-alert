@@ -47,5 +47,8 @@ class WorkerSettings:
         ),
     ]
     redis_settings = RedisSettings.from_dsn(_settings.redis_url)
+    # `arq --check` (the container healthcheck) passes while this key is fresh. arq's
+    # default refreshes it hourly, too slow to notice a hung worker.
+    health_check_interval = 60
     on_startup = startup
     on_shutdown = shutdown
