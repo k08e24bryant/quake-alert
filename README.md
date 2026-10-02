@@ -9,7 +9,7 @@ Earthquake data: **BMKG (Badan Meteorologi, Klimatologi, dan Geofisika)** —
 
 > Layanan ini tidak resmi dan hanya meneruskan data dari BMKG. Notifikasi bisa terlambat atau tidak terkirim. Untuk informasi resmi dan arahan keselamatan, ikuti BMKG (bmkg.go.id / aplikasi InfoBMKG) dan BPBD setempat.
 
-The bot's `/start` shows this disclaimer word for word, and the frontend footer will too.
+The bot's `/start` and the footer of every frontend page show this disclaimer word for word.
 In English: this service is unofficial and only forwards BMKG data; notifications can be
 late or not arrive; for official information and safety guidance, follow BMKG and the local
 disaster agency (BPBD).
@@ -157,6 +157,18 @@ shift or repeat later pages.
   - Breaker state is **per process**. With several uvicorn workers or API replicas, each
     one opens and recovers on its own, so a hung Redis costs up to *threshold* timeouts
     per process rather than in total. Nothing is shared or coordinated between them.
+
+**CORS** lets the frontend read the API from the browser, and nothing more:
+- `CORS_ALLOWED_ORIGINS` is a comma-separated list of exact origins
+  (`https://quake.example.com`, `http://localhost:3000`): scheme, host and port, no path.
+  Empty means no CORS at all. A malformed entry, or `*` in production, stops the API from
+  starting.
+- Only `GET` on `/v1/earthquakes*` and `/v1/status` gets CORS headers. Subscriptions, the
+  Telegram webhook and the health endpoints never do, even for an allowed origin, so no
+  other site's script can read their responses or preflight a write. No credentials.
+- `app/core/cors.py` wraps Starlette's `CORSMiddleware` so it only sees those paths;
+  `tests/integration/test_cors.py` checks allowed, rejected and look-alike origins,
+  preflights, and the paths that must stay uncovered.
 
 **Rate limiting** applies to `/v1/*` (except the Telegram webhook) only, per client IP, with a fixed window of
 `RATE_LIMIT_PER_MINUTE` (60) requests per minute.
@@ -525,6 +537,82 @@ deactivated.
 - **Fail-closed writes depend on the per-process breaker.** Each API process decides on
   its own whether Redis is usable, so during a partial outage some replicas may accept
   writes while others answer `503`. Each accepted write was still counted by Redis.
+
+## Frontend
+
+`frontend/` is a small Next.js (App Router, TypeScript strict) site in Indonesian that
+reads the public API from the browser. The backend is the focus; the frontend shows its
+data honestly.
+
+| Page | Shows |
+|---|---|
+| **Peta** (`/`) | Recent quakes on an OpenStreetMap map (react-leaflet), sized and coloured by magnitude. A popup has magnitude, region, depth, time in WIB, "Potensi (BMKG)" verbatim, felt report, source feeds and the shakemap link. Filters: minimum magnitude and time range. "Gempa di sekitar saya" filters by the browser's location, on click only. A list under the map repeats every marker for keyboard and screen-reader users. |
+| **Riwayat** (`/riwayat`) | A table with magnitude, WIB date range and an optional radius around a point (click the map or type coordinates). "Muat lebih banyak" follows the API's `next_cursor`; there are no page numbers. |
+| **Cara berlangganan** (`/cara-berlangganan`) | The Telegram bot link and commands, and the webhook flow (create, store the secret, verify) with a link to `docs/webhooks.md`. |
+
+<!-- Screenshots: replace with real captures once deployed. -->
+| Peta (380 px, light) | Riwayat (desktop, dark) |
+|---|---|
+| _screenshot: docs/screenshots/peta-mobile.png_ | _screenshot: docs/screenshots/riwayat-dark.png_ |
+
+**On every page:**
+- "Data terakhir diperbarui X menit lalu", from `GET /v1/status` (refreshed every minute).
+  A banner says the data may be outdated, and to check BMKG directly, when the API reports
+  `stale`, when BMKG has never been read, or when `data_as_of` ages past
+  `stale_after_minutes` while the page is open.
+- If the API can't be reached, the page says so plainly. The map is never shown empty in
+  that case, because an empty map reads as "no quakes".
+- The footer has the disclaimer word for word (a test compares it with this README) and
+  "Sumber: BMKG" linking to <https://www.bmkg.go.id>. No BMKG logo, no emoji, never
+  "peringatan dini".
+- Times are WIB with the "WIB" label, as BMKG shows them (fixed UTC+7, computed without
+  relying on the browser's time zone).
+- Mobile first (works at 380 px), light and dark from the system setting, labelled form
+  fields, visible focus, a skip link, and text contrast of at least 4.5:1. Marker colours
+  have at least 3:1 against the map (tested).
+
+**Location privacy.** "Gempa di sekitar saya" asks for the location only when clicked. The
+position is rounded to 2 decimals (about 1 km), kept in memory, and sent only as `lat`/`lon`
+query parameters of the API request. Nothing is stored in the browser. On the server, the
+list cache keys on the rounded parameters for 30 s.
+
+**Leaflet runs in the browser only** (`next/dynamic` with `ssr: false`): it needs `window`.
+The Riwayat explorer is browser-only too, because its default range ("the last 30 days")
+depends on the visitor's date, not the build's.
+
+### Run it locally
+
+```sh
+docker compose up --build        # the API on :8000, with CORS_ALLOWED_ORIGINS=http://localhost:3000 in backend/.env
+cd frontend
+cp .env.example .env.local       # then edit
+npm install
+npm run dev                      # http://localhost:3000
+```
+
+| Variable | Meaning |
+|---|---|
+| `NEXT_PUBLIC_API_BASE_URL` | The API, no trailing slash, e.g. `http://localhost:8000`. The API's `CORS_ALLOWED_ORIGINS` must list the frontend's origin. |
+| `NEXT_PUBLIC_TELEGRAM_BOT_URL` | The bot link on "Cara berlangganan", e.g. `https://t.me/<bot>`. |
+| `NEXT_PUBLIC_REPO_URL` | The GitHub repository, for the link to `docs/webhooks.md`. |
+
+These are inlined into the browser bundle at build time, so they are public: never put a
+secret in them. On Vercel, set them in the project settings (root directory `frontend`) and
+add the deployed origin to the API's `CORS_ALLOWED_ORIGINS`.
+
+### Checks
+
+```sh
+cd frontend
+npm run lint        # ESLint (next/core-web-vitals + typescript)
+npm run typecheck   # next typegen + tsc --noEmit
+npm test            # vitest
+```
+
+The tests cover WIB formatting and day boundaries, "X menit lalu", the magnitude scale
+(bands, sizes, contrast), the API client's error handling (unreachable, timeout, 429, HTTP
+errors, unexpected bodies, cancellation), cursor paging, the stale banner logic, the Riwayat
+filter validation, and the footer's verbatim disclaimer.
 
 ## Design decisions
 
