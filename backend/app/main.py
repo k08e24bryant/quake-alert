@@ -7,6 +7,7 @@ from fastapi import FastAPI
 from app.api import earthquakes, health, status, subscriptions, telegram
 from app.core.circuit_breaker import CircuitBreaker
 from app.core.config import Settings, get_settings
+from app.core.cors import ReadApiCORSMiddleware, cors_origins
 from app.core.crypto import check_startup_secrets
 from app.core.logging import configure_logging
 from app.core.rate_limit import RateLimiter
@@ -62,6 +63,10 @@ def create_app(
             await engine.dispose()
 
     app = FastAPI(title="Quake Alert", version="0.1.0", lifespan=lifespan)
+    # Validated here, so a bad CORS_ALLOWED_ORIGINS (or "*" in production) never starts.
+    origins = cors_origins(app_settings)
+    if origins:
+        app.add_middleware(ReadApiCORSMiddleware, allow_origins=origins)
     app.include_router(health.router)
     app.include_router(earthquakes.router)
     app.include_router(status.router)

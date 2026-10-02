@@ -58,6 +58,10 @@ class Settings(BaseSettings):
     # Only enable behind a proxy you control (Caddy): clients can forge X-Forwarded-For.
     trust_proxy_headers: bool = False
 
+    # Browser origins (comma-separated, exact, e.g. https://quake.example.com) allowed to
+    # GET /v1/earthquakes* and /v1/status. Empty: no CORS. "*" is refused in production.
+    cors_allowed_origins: str = ""
+
     # Telegram Bot API, called directly with httpx. Empty = not configured: the webhook
     # rejects every request and deliveries fail without calling Telegram.
     telegram_bot_token: SecretStr = SecretStr("")
