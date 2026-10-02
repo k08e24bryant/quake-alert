@@ -18,7 +18,10 @@ from app.ingestion.retention import prune_ingestion_runs
 from app.ingestion.service import FeedIngestionResult, ingest_all_feeds
 from app.notifications.dispatcher import NotifyConfig, RetryDeliveryError, deliver
 from app.notifications.matcher import MatchResult, match_flagged, pending_delivery_ids
-from app.notifications.retention import prune_notification_deliveries
+from app.notifications.retention import (
+    prune_notification_deliveries,
+    prune_pending_webhook_subscriptions,
+)
 from app.notifications.telegram import TelegramClient
 from app.notifications.webhook import WebhookNotifier, create_webhook_http_client
 
@@ -190,12 +193,18 @@ def _retry_or_raise(ctx: dict[str, Any], exc: Exception, message: str, **extra: 
 
 
 async def prune_old_records(ctx: dict[str, Any]) -> dict[str, int]:
-    """Daily retention for ingestion_runs and notification_deliveries; see
-    app.ingestion.retention and app.notifications.retention."""
+    """Daily retention for ingestion_runs, notification_deliveries and webhook
+    subscriptions that never passed verification; see app.ingestion.retention and
+    app.notifications.retention."""
     now = datetime.now(UTC)
     async with ctx["session_factory"]() as session, session.begin():
         runs = await prune_ingestion_runs(session, now, ctx["settings"])
         deliveries = await prune_notification_deliveries(session, now, ctx["settings"])
-    deleted = {"ingestion_runs": runs, "notification_deliveries": deliveries}
+        pending = await prune_pending_webhook_subscriptions(session, now, ctx["settings"])
+    deleted = {
+        "ingestion_runs": runs,
+        "notification_deliveries": deliveries,
+        "pending_webhook_subscriptions": pending,
+    }
     logger.info("pruned old records", extra=deleted)
     return deleted

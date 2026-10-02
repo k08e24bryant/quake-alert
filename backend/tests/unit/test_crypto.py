@@ -35,6 +35,14 @@ def test_rotation_encrypts_with_the_first_key_and_decrypts_with_any() -> None:
     assert SecretBox([FERNET_KEY]).decrypt(re_encrypted) == "whsec_abc"  # old key not needed
 
 
+def test_is_current_only_for_the_first_key() -> None:
+    rotated = SecretBox([FERNET_KEY, OTHER_FERNET_KEY])
+
+    assert rotated.is_current(SecretBox([FERNET_KEY]).encrypt("whsec_abc"))
+    assert not rotated.is_current(SecretBox([OTHER_FERNET_KEY]).encrypt("whsec_abc"))
+    assert not rotated.is_current("not-a-fernet-token")
+
+
 def test_unknown_key_cannot_decrypt() -> None:
     encrypted = SecretBox([OTHER_FERNET_KEY]).encrypt("whsec_abc")
 

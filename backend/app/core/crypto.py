@@ -2,7 +2,7 @@
 
 MultiFernet over WEBHOOK_SECRET_KEYS: encrypt with the first key, decrypt with any of them,
 so a key can be rotated by putting the new one first and keeping the old ones until every
-stored secret has been re-encrypted (see README).
+stored secret has been re-encrypted by scripts/rotate_webhook_secrets.py (see README).
 """
 
 from collections.abc import Sequence
@@ -21,9 +21,11 @@ class SecretBox:
         if not keys:
             raise ValueError("at least one key is required")
         try:
-            self._fernet = MultiFernet([Fernet(key) for key in keys])
+            fernets = [Fernet(key) for key in keys]
         except ValueError as exc:  # never echo the key itself
             raise ValueError("WEBHOOK_SECRET_KEYS contains an invalid Fernet key") from exc
+        self._primary = fernets[0]
+        self._fernet = MultiFernet(fernets)
 
     def encrypt(self, plaintext: str) -> str:
         return self._fernet.encrypt(plaintext.encode()).decode()
@@ -33,6 +35,14 @@ class SecretBox:
             return self._fernet.decrypt(token.encode()).decode()
         except InvalidToken:
             raise SecretBoxError("no configured key decrypts this secret") from None
+
+    def is_current(self, token: str) -> bool:
+        """Whether the first (newest) key alone decrypts `token`: nothing to rotate."""
+        try:
+            self._primary.decrypt(token.encode())
+        except InvalidToken:
+            return False
+        return True
 
     def rotate(self, token: str) -> str:
         """Re-encrypt with the first (newest) key."""

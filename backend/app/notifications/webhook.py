@@ -9,17 +9,25 @@ Every request:
     of the response (raw, never decompressed);
   - is signed: X-Quake-Signature: sha256=HMAC_SHA256(secret, f"{timestamp}.{body}").
 
-Status codes: 2xx sent; 410 gone (deactivate); other 3xx/4xx permanent; 5xx retry.
+Status codes: 2xx sent; 410 gone (deactivate); 429 retry after its Retry-After (capped);
+other 3xx/4xx permanent; 5xx retry.
+
+Ownership verification (verify()): a signed "webhook.verification" request carrying a
+random challenge, which the receiver must echo as {"challenge": "<same value>"} in a 2xx
+answer. It goes through the same post() as every alert: same SSRF checks, no bypass.
 """
 
 import hashlib
 import hmac
 import json
 import re
+import secrets
 import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import UTC
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import httpx
@@ -28,6 +36,7 @@ from app.core.config import Settings
 from app.core.crypto import SecretBox, SecretBoxError, secret_box_from_settings
 from app.notifications.base import (
     AlertData,
+    NotifierError,
     PermanentNotifierError,
     Recipient,
     RecipientGoneError,
@@ -49,6 +58,7 @@ SCHEMA_VERSION = 1
 EVENT_ALERT = "earthquake.alert"
 EVENT_SYNTHETIC = "earthquake.test"  # a dev-only synthetic quake, never a real one
 EVENT_WEBHOOK_TEST = "webhook.test"  # POST /v1/subscriptions/webhook/{id}/test
+EVENT_VERIFICATION = "webhook.verification"  # ownership check: echo the challenge
 POTENTIAL_LABEL = "Potensi (BMKG)"
 SOURCE = {"notice": "Sumber: BMKG", "url": "https://www.bmkg.go.id"}
 
@@ -118,11 +128,45 @@ def webhook_test_payload(delivery_id: uuid.UUID) -> dict[str, Any]:
     return _envelope(event=EVENT_WEBHOOK_TEST, delivery_id=delivery_id, test=True, synthetic=False)
 
 
+def verification_payload(delivery_id: uuid.UUID, challenge: str) -> dict[str, Any]:
+    """Proves the receiver wants our requests: it must echo `challenge`. No quake data."""
+    payload = _envelope(
+        event=EVENT_VERIFICATION, delivery_id=delivery_id, test=True, synthetic=False
+    )
+    payload["challenge"] = challenge
+    return payload
+
+
+def retry_after_seconds(value: str | None, now: float) -> float | None:
+    """Seconds to wait from a Retry-After header: delay-seconds or an HTTP date (RFC 9110).
+    None if absent or unparseable; a date in the past means 0."""
+    if value is None:
+        return None
+    value = value.strip()
+    if value.isascii() and value.isdigit():
+        return float(value)
+    try:
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:  # "-0000": UTC by RFC 5322
+        when = when.replace(tzinfo=UTC)
+    return max(0.0, when.timestamp() - now)
+
+
 @dataclass(frozen=True, slots=True)
 class WebhookResponse:
     status_code: int
     body: bytes  # at most max_response_bytes
     truncated: bool
+    retry_after: str | None = None  # the raw Retry-After header
+
+
+@dataclass(frozen=True, slots=True)
+class VerificationResult:
+    verified: bool
+    status_code: int | None  # the receiver's status code, if it answered 2xx
+    error: str | None
 
 
 class WebhookNotifier:
@@ -136,6 +180,7 @@ class WebhookNotifier:
         allow_http: bool,
         timeout_seconds: float,
         max_response_bytes: int,
+        max_retry_after_seconds: float = 300,
         resolver: Resolver = system_resolver,
         clock: Callable[[], float] = time.time,
     ) -> None:
@@ -144,6 +189,7 @@ class WebhookNotifier:
         self._allow_http = allow_http
         self._timeout = httpx.Timeout(timeout_seconds)
         self._max_response_bytes = max_response_bytes
+        self._max_retry_after = max_retry_after_seconds
         self._resolver = resolver
         self._clock = clock
 
@@ -157,6 +203,7 @@ class WebhookNotifier:
             allow_http=settings.environment == "development",
             timeout_seconds=settings.webhook_timeout_seconds,
             max_response_bytes=settings.webhook_max_response_bytes,
+            max_retry_after_seconds=settings.webhook_max_retry_after_seconds,
             resolver=resolver,
         )
 
@@ -177,6 +224,24 @@ class WebhookNotifier:
     async def send_test(self, recipient: Recipient) -> WebhookResponse:
         delivery_id = uuid.uuid4()
         return await self.post(recipient, webhook_test_payload(delivery_id), delivery_id)
+
+    async def verify(self, recipient: Recipient) -> VerificationResult:
+        """Send a fresh challenge once; verified only if a 2xx answer echoes it exactly."""
+        challenge = secrets.token_urlsafe(32)
+        delivery_id = uuid.uuid4()
+        try:
+            response = await self.post(
+                recipient, verification_payload(delivery_id, challenge), delivery_id
+            )
+        except NotifierError as exc:
+            return VerificationResult(verified=False, status_code=None, error=exc.description)
+        if not _echoes(response, challenge):
+            return VerificationResult(
+                verified=False,
+                status_code=response.status_code,
+                error='the response body is not {"challenge": "<the challenge we sent>"}',
+            )
+        return VerificationResult(verified=True, status_code=response.status_code, error=None)
 
     async def post(
         self, recipient: Recipient, payload: dict[str, Any], delivery_id: uuid.UUID
@@ -225,7 +290,11 @@ class WebhookNotifier:
             raise RetryableNotifierError("timeout") from None
         except httpx.TransportError as exc:
             raise RetryableNotifierError(f"connection failed: {type(exc).__name__}") from None
-        return self._judge(WebhookResponse(response.status_code, received, truncated))
+        return self._judge(
+            WebhookResponse(
+                response.status_code, received, truncated, response.headers.get("retry-after")
+            )
+        )
 
     async def _read_limited(self, response: httpx.Response) -> tuple[bytes, bool]:
         received = bytearray()
@@ -243,11 +312,29 @@ class WebhookNotifier:
         description = f"HTTP {status}" + (f": {snippet}" if snippet else "")
         if status == 410:
             raise RecipientGoneError(description)
+        if status == 429:
+            wait = retry_after_seconds(response.retry_after, self._clock())
+            raise RetryableNotifierError(
+                description,
+                retry_after=None if wait is None else min(wait, self._max_retry_after),
+                rate_limited=True,
+            )
         if 300 <= status < 400:
             raise PermanentNotifierError(f"HTTP {status}: redirect not followed")
         if status >= 500:
             raise RetryableNotifierError(description)
         raise PermanentNotifierError(description)
+
+
+def _echoes(response: WebhookResponse, challenge: str) -> bool:
+    if response.truncated:
+        return False
+    try:
+        body = json.loads(response.body)
+    except ValueError:  # includes UnicodeDecodeError
+        return False
+    echoed = body.get("challenge") if isinstance(body, dict) else None
+    return isinstance(echoed, str) and hmac.compare_digest(echoed.encode(), challenge.encode())
 
 
 def create_webhook_http_client() -> httpx.AsyncClient:

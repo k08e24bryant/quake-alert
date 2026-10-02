@@ -4,7 +4,7 @@ from sqlalchemy import delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
-from app.db.models import DeliveryStatus, NotificationDelivery
+from app.db.models import DeliveryStatus, NotificationDelivery, Subscription, SubscriptionChannel
 
 
 async def prune_notification_deliveries(
@@ -22,5 +22,24 @@ async def prune_notification_deliveries(
             NotificationDelivery.created_at < cutoff,
         )
         .returning(NotificationDelivery.id)
+    )
+    return len(deleted.all())
+
+
+async def prune_pending_webhook_subscriptions(
+    session: AsyncSession, now: datetime, settings: Settings
+) -> int:
+    """Delete webhook subscriptions created more than
+    webhook_pending_verification_max_age_hours ago that never passed verification; return
+    how many. They were never active, so they have no deliveries."""
+    cutoff = now - timedelta(hours=settings.webhook_pending_verification_max_age_hours)
+    deleted = await session.scalars(
+        delete(Subscription)
+        .where(
+            Subscription.channel == SubscriptionChannel.WEBHOOK,
+            Subscription.verified_at.is_(None),
+            Subscription.created_at < cutoff,
+        )
+        .returning(Subscription.id)
     )
     return len(deleted.all())

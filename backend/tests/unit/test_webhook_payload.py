@@ -4,6 +4,7 @@ import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal
+from email.utils import formatdate
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +12,14 @@ import pytest
 
 from app.notifications.base import AlertData
 from app.notifications.messages import DISCLAIMER
-from app.notifications.webhook import alert_payload, encode, sign, webhook_test_payload
+from app.notifications.webhook import (
+    alert_payload,
+    encode,
+    retry_after_seconds,
+    sign,
+    verification_payload,
+    webhook_test_payload,
+)
 from tests.webhook_samples import expected_signature
 
 DOCS = Path(__file__).resolve().parents[3] / "docs" / "webhooks.md"
@@ -89,6 +97,45 @@ def test_webhook_test_payload_carries_no_quake() -> None:
     assert body["disclaimer"] == DISCLAIMER
 
 
+def test_verification_payload_carries_the_challenge_and_no_quake() -> None:
+    body = verification_payload(uuid.UUID(int=1), "the-challenge")
+
+    assert (body["event"], body["test"], body["synthetic"]) == (
+        "webhook.verification",
+        True,
+        False,
+    )
+    assert (body["challenge"], body["earthquake"]) == ("the-challenge", None)
+    assert body["source"] == {"notice": "Sumber: BMKG", "url": "https://www.bmkg.go.id"}
+    assert body["disclaimer"] == DISCLAIMER
+
+
+NOW = 1_790_851_492.0
+
+
+@pytest.mark.parametrize(
+    ("header", "seconds"),
+    [
+        ("120", 120.0),
+        (" 120 ", 120.0),
+        ("0", 0.0),
+        (formatdate(NOW + 90, usegmt=True), 90.0),  # IMF-fixdate
+        ("Thu, 01 Oct 2026 10:46:22 GMT", 90.0),  # the same, spelled out
+        ("Thursday, 01-Oct-26 10:46:22 GMT", 90.0),  # obsolete RFC 850 form
+        ("Thu Oct  1 10:46:22 2026", 90.0),  # obsolete asctime form
+        (formatdate(NOW - 600, usegmt=True), 0.0),  # already past
+        (None, None),
+        ("", None),
+        ("soon", None),
+        ("-5", None),
+        ("1.5", None),
+        ("\uff11\uff12", None),  # full-width digits are not delay-seconds
+    ],
+)
+def test_retry_after_parsing(header: str | None, seconds: float | None) -> None:
+    assert retry_after_seconds(header, NOW) == seconds
+
+
 def test_signature_is_hmac_sha256_of_timestamp_dot_body() -> None:
     body = encode(alert_payload(alert()))
 
@@ -108,12 +155,23 @@ def test_encoding_is_compact_utf8() -> None:
 
 
 @pytest.fixture(scope="module")
-def verify_quake_webhook() -> Callable[..., bool]:
+def docs_example() -> dict[str, Any]:
     blocks = re.findall(r"```python\n(.*?)```", DOCS.read_text(encoding="utf-8"), re.DOTALL)
     [code] = [block for block in blocks if "def verify_quake_webhook" in block]
     namespace: dict[str, Any] = {"__name__": "docs_example"}  # skips the __main__ server
     exec(compile(code, str(DOCS), "exec"), namespace)  # noqa: S102  (our own docs)
-    function: Callable[..., bool] = namespace["verify_quake_webhook"]
+    return namespace
+
+
+@pytest.fixture(scope="module")
+def verify_quake_webhook(docs_example: dict[str, Any]) -> Callable[..., bool]:
+    function: Callable[..., bool] = docs_example["verify_quake_webhook"]
+    return function
+
+
+@pytest.fixture(scope="module")
+def handle_quake_webhook(docs_example: dict[str, Any]) -> Callable[..., tuple[int, bytes]]:
+    function: Callable[..., tuple[int, bytes]] = docs_example["handle_quake_webhook"]
     return function
 
 
@@ -164,3 +222,54 @@ def test_docs_receiver_rejects(
         del headers["x-quake-signature"]
 
     assert not verify_quake_webhook(key, headers, body, now=1_000_000 + now_offset)
+
+
+def signed(secret: str, payload: dict[str, Any], timestamp: int) -> tuple[dict[str, str], bytes]:
+    body = encode(payload)
+    headers = {
+        "x-quake-timestamp": str(timestamp),
+        "x-quake-signature": sign(secret, timestamp, body),
+        "x-quake-delivery-id": payload["delivery_id"],
+    }
+    return headers, body
+
+
+def test_docs_receiver_echoes_a_correctly_signed_challenge(
+    handle_quake_webhook: Callable[..., tuple[int, bytes]],
+) -> None:
+    headers, body = signed(
+        "whsec_test", verification_payload(uuid.uuid4(), "Zq3x-challenge"), 1_000_000
+    )
+
+    status, answer = handle_quake_webhook("whsec_test", headers, body, set(), now=1_000_000)
+
+    assert status == 200
+    assert json.loads(answer) == {"challenge": "Zq3x-challenge"}
+
+
+def test_docs_receiver_refuses_a_challenge_it_cannot_verify(
+    handle_quake_webhook: Callable[..., tuple[int, bytes]],
+) -> None:
+    # E.g. the creation-time attempt, before the receiver was given the signing secret.
+    headers, body = signed(
+        "whsec_new", verification_payload(uuid.uuid4(), "Zq3x-challenge"), 1_000_000
+    )
+
+    status, answer = handle_quake_webhook("whsec_old", headers, body, set(), now=1_000_000)
+
+    assert (status, answer) == (401, b"")
+
+
+def test_docs_receiver_acknowledges_alerts_once(
+    handle_quake_webhook: Callable[..., tuple[int, bytes]],
+) -> None:
+    seen: set[str] = set()
+    alert_request = signed("whsec_test", alert_payload(alert()), 1_000_000)
+    test_request = signed("whsec_test", webhook_test_payload(uuid.uuid4()), 1_000_000)
+
+    first = handle_quake_webhook("whsec_test", *alert_request, seen, now=1_000_000)
+    retry = handle_quake_webhook("whsec_test", *alert_request, seen, now=1_000_000)
+    test = handle_quake_webhook("whsec_test", *test_request, seen, now=1_000_000)
+
+    assert first == retry == test == (204, b"")
+    assert seen == {"6c1d9e2a-8f3b-4a77-b1c0-5e2f7d9a3b48", test_request[0]["x-quake-delivery-id"]}

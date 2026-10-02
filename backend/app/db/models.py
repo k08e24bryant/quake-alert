@@ -144,6 +144,9 @@ class Subscription(Base):
     manage_token_hash: Mapped[str | None] = mapped_column(Text)
     # Failed webhook deliveries in a row; reset by a success. Unused for Telegram.
     consecutive_failures: Mapped[int] = mapped_column(Integer, server_default="0")
+    # When the receiver echoed our verification challenge (webhooks only). A webhook row
+    # without it is pending verification: inactive, never matched, pruned after a day.
+    verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     # Rounded to 2 decimals (~1 km) before it is stored, for the subscriber's privacy.
     location: Mapped[WKBElement | WKTElement] = mapped_column(
         Geography(geometry_type="POINT", srid=4326, spatial_index=False)
@@ -163,6 +166,11 @@ class Subscription(Base):
             "channel <> 'webhook' OR (webhook_url IS NOT NULL"
             " AND webhook_secret_encrypted IS NOT NULL AND manage_token_hash IS NOT NULL)",
             name="webhook_fields",
+        ),
+        # Pending verification is never active, so it is never matched.
+        CheckConstraint(
+            "channel <> 'webhook' OR verified_at IS NOT NULL OR NOT is_active",
+            name="webhook_verified",
         ),
     )
 

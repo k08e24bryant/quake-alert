@@ -88,8 +88,13 @@ class Settings(BaseSettings):
     webhook_max_response_bytes: int = Field(default=65536, ge=0)
     # A webhook subscription is deactivated after this many failed deliveries in a row.
     webhook_max_consecutive_failures: int = Field(default=10, ge=1)
+    # A receiver's 429 is retried after its Retry-After, but never waits longer than this.
+    webhook_max_retry_after_seconds: int = Field(default=300, ge=0)
+    # Daily prune: webhook subscriptions still pending verification this long after they
+    # were created are deleted.
+    webhook_pending_verification_max_age_hours: int = Field(default=24, ge=1)
     # Per client IP, on top of RATE_LIMIT_PER_MINUTE: POST /v1/subscriptions/webhook and
-    # POST /v1/subscriptions/webhook/{id}/test share this hourly budget.
+    # its .../test and .../verify share this hourly budget.
     subscription_write_rate_limit_per_hour: int = Field(default=5, ge=1)
 
     # Daily prune: sent/failed deliveries older than this are deleted; pending never are.

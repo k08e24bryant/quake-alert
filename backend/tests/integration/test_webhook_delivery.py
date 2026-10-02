@@ -6,6 +6,7 @@ import uuid
 from collections.abc import AsyncIterator
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from email.utils import formatdate
 from typing import Any
 
 import httpx
@@ -39,6 +40,7 @@ from tests.webhook_samples import (
 )
 
 SECRET = "whsec_delivery-test"  # noqa: S105  (fake)
+CLOCK = 1_790_851_492  # the notifier's "now" (Unix seconds)
 CONFIG = NotifyConfig(
     max_age=timedelta(minutes=30),
     max_attempts=5,
@@ -70,8 +72,9 @@ def notifier(
         allow_http=allow_http,
         timeout_seconds=5,
         max_response_bytes=65536,
+        max_retry_after_seconds=300,
         resolver=dns or resolver(),
-        clock=lambda: 1_790_851_492,
+        clock=lambda: CLOCK,
     )
 
 
@@ -322,7 +325,7 @@ async def test_410_deactivates_without_retry(
     assert await state(db_session, delivery) == (DeliveryStatus.FAILED, 1, "HTTP 410")
 
 
-@pytest.mark.parametrize("status", [400, 401, 403, 404, 422, 429])
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 422])
 async def test_other_4xx_fail_without_retry(
     worker_ctx: dict[str, Any],
     db_session: AsyncSession,
@@ -338,6 +341,119 @@ async def test_other_4xx_fail_without_retry(
     assert outcome is DeliveryOutcome.FAILED
     assert await state(db_session, delivery) == (DeliveryStatus.FAILED, 1, f"HTTP {status}: nope")
     assert await subscription_state(db_session, delivery.subscription_id) == (True, 1)
+
+
+# --- 429: retry after Retry-After ----------------------------------------------------------
+
+
+def http_date(unix_seconds: float) -> str:
+    return formatdate(unix_seconds, usegmt=True)  # e.g. "Thu, 01 Oct 2026 10:44:52 GMT"
+
+
+@pytest.mark.parametrize(
+    ("retry_after", "defer"),
+    [
+        ("120", 120),  # delay-seconds
+        (http_date(CLOCK + 90), 90),  # HTTP date
+        ("3600", 300),  # capped at WEBHOOK_MAX_RETRY_AFTER_SECONDS
+        (http_date(CLOCK + 86_400), 300),  # capped, as a date too
+        ("0", 0),
+        (http_date(CLOCK - 60), 0),  # a date already past: retry now
+        (None, 5),  # no header: the usual backoff
+        ("soon", 5),  # unparseable: the usual backoff
+    ],
+)
+async def test_429_is_retried_after_retry_after(
+    worker_ctx: dict[str, Any],
+    db_session: AsyncSession,
+    webhook_http: httpx.AsyncClient,
+    respx_mock: respx.MockRouter,
+    retry_after: str | None,
+    defer: float,
+) -> None:
+    headers = {} if retry_after is None else {"Retry-After": retry_after}
+    respx_mock.post(IP_URL).respond(429, headers=headers, text="slow down")
+    delivery = await new_delivery(db_session)
+
+    with pytest.raises(RetryDeliveryError) as caught:
+        await run(worker_ctx, notifier(webhook_http), delivery, attempt=1)
+
+    assert caught.value.defer_seconds == defer
+    # Still an attempt; and asking us to slow down is not a failure of the endpoint.
+    assert await state(db_session, delivery) == (
+        DeliveryStatus.PENDING,
+        1,
+        "rate limited: HTTP 429: slow down",
+    )
+    assert await subscription_state(db_session, delivery.subscription_id) == (True, 0)
+
+
+async def test_429_then_success(
+    worker_ctx: dict[str, Any],
+    db_session: AsyncSession,
+    webhook_http: httpx.AsyncClient,
+    respx_mock: respx.MockRouter,
+) -> None:
+    route = respx_mock.post(IP_URL)
+    route.side_effect = [httpx.Response(429, headers={"Retry-After": "7"}), httpx.Response(200)]
+    delivery = await new_delivery(db_session)
+    webhook = notifier(webhook_http)
+
+    with pytest.raises(RetryDeliveryError):
+        await run(worker_ctx, webhook, delivery, attempt=1)
+
+    assert await run(worker_ctx, webhook, delivery, attempt=2) is DeliveryOutcome.SENT
+    assert await state(db_session, delivery) == (DeliveryStatus.SENT, 2, None)
+
+
+@pytest.mark.parametrize(("status", "counted"), [(429, 0), (503, 1)])
+async def test_429_on_the_last_attempt_fails_without_counting_towards_deactivation(
+    worker_ctx: dict[str, Any],
+    db_session: AsyncSession,
+    webhook_http: httpx.AsyncClient,
+    respx_mock: respx.MockRouter,
+    status: int,
+    counted: int,
+) -> None:
+    respx_mock.post(IP_URL).respond(status, headers={"Retry-After": "10"})
+    delivery = await new_delivery(db_session)
+
+    outcome = await run(worker_ctx, notifier(webhook_http), delivery, attempt=5)
+
+    assert outcome is DeliveryOutcome.FAILED
+    assert (await state(db_session, delivery))[:2] == (DeliveryStatus.FAILED, 1)
+    assert await subscription_state(db_session, delivery.subscription_id) == (True, counted)
+
+
+@pytest.mark.parametrize(("status", "counted"), [(429, 0), (503, 1)])
+async def test_429_still_respects_the_freshness_window(
+    worker_ctx: dict[str, Any],
+    db_session: AsyncSession,
+    webhook_http: httpx.AsyncClient,
+    respx_mock: respx.MockRouter,
+    status: int,
+    counted: int,
+) -> None:
+    route = respx_mock.post(IP_URL).respond(status, headers={"Retry-After": "300"})
+    occurred_at = now() - timedelta(minutes=27)
+    delivery = await new_delivery(db_session, occurred_at=occurred_at)
+    webhook = notifier(webhook_http)
+
+    with pytest.raises(RetryDeliveryError):
+        await run(worker_ctx, webhook, delivery, attempt=1)
+    # The receiver's wait (300 s) took the quake past the 30-minute window: dropped.
+    later = occurred_at + timedelta(minutes=32)
+    outcome = await run(worker_ctx, webhook, delivery, attempt=2, at=later)
+
+    assert outcome is DeliveryOutcome.EXPIRED
+    assert route.call_count == 1
+    assert await state(db_session, delivery) == (
+        DeliveryStatus.FAILED,
+        1,
+        "expired before sending",
+    )
+    # A 503 before expiry counts against the endpoint; a 429 doesn't.
+    assert await subscription_state(db_session, delivery.subscription_id) == (True, counted)
 
 
 async def test_redirect_is_not_followed(

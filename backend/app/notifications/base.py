@@ -55,12 +55,17 @@ class NotifierError(Exception):
 
 
 class RetryableNotifierError(NotifierError):
-    """Network error, timeout, 5xx: a later attempt may succeed. `retry_after` overrides the
-    exponential backoff when the channel says how long to wait (Telegram 429)."""
+    """Network error, timeout, 5xx, 429: a later attempt may succeed. `retry_after`
+    overrides the exponential backoff when the channel says how long to wait (Telegram 429,
+    webhook Retry-After). `rate_limited` means the recipient only asked us to slow down: a
+    delivery that ends failed that way does not count towards deactivating a webhook."""
 
-    def __init__(self, description: str, *, retry_after: float | None = None) -> None:
+    def __init__(
+        self, description: str, *, retry_after: float | None = None, rate_limited: bool = False
+    ) -> None:
         super().__init__(description)
         self.retry_after = retry_after
+        self.rate_limited = rate_limited
 
 
 class RecipientGoneError(NotifierError):

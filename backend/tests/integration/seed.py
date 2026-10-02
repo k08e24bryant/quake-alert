@@ -1,7 +1,7 @@
 """Insert earthquakes rows directly, for API tests that need exact data (not ingestion)."""
 
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 
 from geoalchemy2 import WKTElement
@@ -95,8 +95,11 @@ async def seed_webhook_subscription(
     radius_km: int = 200,
     min_magnitude: str = "4.0",
     is_active: bool = True,
+    verified: bool = True,
     manage_token_hash: str = "0" * 64,
+    created_at: datetime | None = None,
 ) -> Subscription:
+    """Verified by default; verified=False is pending verification, and so inactive."""
     lat, lon = at
     row = Subscription(
         channel=SubscriptionChannel.WEBHOOK,
@@ -106,8 +109,11 @@ async def seed_webhook_subscription(
         location=WKTElement(f"POINT({lon} {lat})", srid=4326),
         radius_km=radius_km,
         min_magnitude=Decimal(min_magnitude),
-        is_active=is_active,
+        is_active=is_active and verified,
+        verified_at=datetime.now(UTC) if verified else None,
     )
+    if created_at is not None:
+        row.created_at = created_at
     session.add(row)
     await session.flush()
     return row

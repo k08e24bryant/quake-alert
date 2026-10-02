@@ -5,6 +5,13 @@
   brute-forced, and comparing hashes in constant time leaks nothing about it.
 - Every authentication failure (no token, wrong token, unknown id, a Telegram
   subscription's id) looks the same to the caller: not found.
+
+Lifecycle: pending_verification -> active -> inactive, never backwards.
+- A new subscription is pending (inactive, so never matched) until its receiver echoes a
+  verification challenge: tried once on creation, then again on each POST .../verify.
+  Still pending a day later -> deleted by the daily prune.
+- Active subscriptions are deactivated by a 410 or by consecutive failed deliveries.
+  Nothing reactivates them: delete and create a new one.
 """
 
 import hashlib
@@ -12,16 +19,18 @@ import hmac
 import secrets
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
+from enum import StrEnum
 
 from geoalchemy2 import WKTElement
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import Subscription, SubscriptionChannel
 from app.notifications.base import Recipient
 from app.notifications.subscriptions import round_coordinate
-from app.notifications.webhook import WebhookNotifier
+from app.notifications.webhook import VerificationResult, WebhookNotifier
 
 SECRET_PREFIX = "whsec_"  # noqa: S105  (a prefix, not a secret)
 MANAGE_TOKEN_PREFIX = "qamt_"  # noqa: S105  (a prefix, not a secret)
@@ -29,6 +38,24 @@ MANAGE_TOKEN_PREFIX = "qamt_"  # noqa: S105  (a prefix, not a secret)
 
 class WebhookChannelUnavailableError(Exception):
     """WEBHOOK_SECRET_KEYS is not set (only possible outside production)."""
+
+
+class WebhookStatus(StrEnum):
+    PENDING_VERIFICATION = "pending_verification"
+    ACTIVE = "active"
+    INACTIVE = "inactive"
+
+
+def status_of(row: Subscription) -> WebhookStatus:
+    if row.verified_at is None:
+        return WebhookStatus.PENDING_VERIFICATION
+    return WebhookStatus.ACTIVE if row.is_active else WebhookStatus.INACTIVE
+
+
+@dataclass(frozen=True, slots=True)
+class Verification:
+    status: WebhookStatus  # after this attempt
+    result: VerificationResult
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,6 +68,7 @@ class CreatedWebhookSubscription:
     min_magnitude: Decimal
     signing_secret: str
     manage_token: str
+    verification: Verification
 
 
 def hash_token(token: str) -> str:
@@ -56,8 +84,12 @@ async def create_webhook_subscription(
     longitude: float,
     radius_km: int,
     min_magnitude: Decimal,
+    now: datetime,
 ) -> CreatedWebhookSubscription:
-    """Raises UnsafeTargetError / DnsResolutionError for a URL that may not be called."""
+    """Store the subscription as pending, then try to verify it once. The credentials are
+    returned either way: the owner needs the manage token to retry the verification.
+
+    Raises UnsafeTargetError / DnsResolutionError for a URL that may not be called."""
     box = notifier.secret_box
     if box is None:
         raise WebhookChannelUnavailableError
@@ -74,11 +106,13 @@ async def create_webhook_subscription(
         location=WKTElement(f"POINT({lon} {lat})", srid=4326),
         radius_km=radius_km,
         min_magnitude=min_magnitude,
-        is_active=True,
+        is_active=False,  # until verified
+        verified_at=None,
     )
     async with session.begin():
         session.add(row)
         await session.flush()
+    verification = await verify_webhook_subscription(session, notifier, row, now=now)
     return CreatedWebhookSubscription(
         id=row.id,
         url=url,
@@ -88,7 +122,50 @@ async def create_webhook_subscription(
         min_magnitude=min_magnitude,
         signing_secret=signing_secret,
         manage_token=manage_token,
+        verification=verification,
     )
+
+
+class NotPendingVerificationError(Exception):
+    """Only a pending subscription can be verified; an inactive one is never reactivated."""
+
+    def __init__(self, status: WebhookStatus) -> None:
+        super().__init__(status.value)
+        self.status = status
+
+
+class SubscriptionGoneError(Exception):
+    """The subscription was deleted while its receiver was being verified."""
+
+
+async def verify_webhook_subscription(
+    session: AsyncSession, notifier: WebhookNotifier, row: Subscription, *, now: datetime
+) -> Verification:
+    """Send a challenge to a pending subscription's receiver; activate it if echoed.
+
+    Raises NotPendingVerificationError for a subscription that is not pending, and
+    SubscriptionGoneError if it was deleted while waiting on the receiver."""
+    if (status := status_of(row)) is not WebhookStatus.PENDING_VERIFICATION:
+        raise NotPendingVerificationError(status)
+    recipient = recipient_of(row)
+    await session.close()  # don't hold a connection while waiting on the receiver
+    result = await notifier.verify(recipient)
+    if not result.verified:
+        return Verification(WebhookStatus.PENDING_VERIFICATION, result)
+    async with session.begin():
+        activated = await session.scalar(
+            update(Subscription)
+            # Only from pending: never resurrects a row deleted or changed meanwhile.
+            .where(Subscription.id == recipient.subscription_id, Subscription.verified_at.is_(None))
+            .values(verified_at=now, is_active=True)
+            .returning(Subscription.id)
+        )
+    if activated is None:  # deleted, or verified by a concurrent request, meanwhile
+        refreshed = await session.get(Subscription, recipient.subscription_id)
+        if refreshed is None:
+            raise SubscriptionGoneError
+        return Verification(status_of(refreshed), result)
+    return Verification(WebhookStatus.ACTIVE, result)
 
 
 async def authenticate(

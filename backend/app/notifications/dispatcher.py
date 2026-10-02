@@ -14,7 +14,10 @@ quake is only ever sent in development. Then the channel's notifier tries once:
                             failed after the last attempt
   - PermanentNotifierError -> failed, no retry
 A webhook subscription whose deliveries end `failed` max_consecutive_failures times in a
-row is deactivated (logged once). Telegram subscriptions are never counted.
+row is deactivated (logged once). Telegram subscriptions are never counted. Neither is a
+delivery whose last attempt was rate limited (a webhook 429): the receiver asked us to
+slow down, which is not a broken endpoint, whether the retries then ran out or the quake
+got too old to send.
 
 Delivery is at-least-once: if the channel accepted the alert but recording `sent` fails,
 the retry sends it again. Per the safety principle a duplicate beats a missed alert.
@@ -51,6 +54,10 @@ from app.notifications.subscriptions import deactivate
 from app.notifications.telegram import TelegramClient, TelegramNotifier
 
 logger = logging.getLogger(__name__)
+
+# Marks last_error of an attempt the recipient rate limited, so that a later attempt (or
+# the expiry check) knows the delivery's last failure was not the receiver's fault.
+RATE_LIMITED_PREFIX = "rate limited: "
 
 
 class DeliveryOutcome(StrEnum):
@@ -101,7 +108,14 @@ class _Pending:
     recipient: Recipient
     is_active: bool
     attempts: int  # attempts already made before this one
+    last_error: str | None
     alert: AlertData
+
+    @property
+    def last_attempt_failed_by_receiver(self) -> bool:
+        """An earlier attempt reached the receiver and the last one was not rate limited."""
+        rate_limited = (self.last_error or "").startswith(RATE_LIMITED_PREFIX)
+        return self.attempts > 0 and not rate_limited
 
 
 async def deliver(
@@ -131,7 +145,13 @@ async def deliver(
     if pending.alert.occurred_at < now - config.max_age:
         # Not this attempt's fault, but if earlier attempts failed, the delivery failed.
         await _fail(
-            session_factory, pending, delivery_id, "expired before sending", config, tried=False
+            session_factory,
+            pending,
+            delivery_id,
+            "expired before sending",
+            config,
+            tried=False,
+            receiver_failed=pending.last_attempt_failed_by_receiver,
         )
         return DeliveryOutcome.EXPIRED
     if pending.alert.is_synthetic and not config.allow_synthetic:
@@ -162,11 +182,17 @@ async def deliver(
         )
         return DeliveryOutcome.DEACTIVATED
     except RetryableNotifierError as exc:
+        error = RATE_LIMITED_PREFIX + exc.description if exc.rate_limited else exc.description
         if attempt >= config.max_attempts:
-            return await _give_up(session_factory, pending, delivery_id, exc.description, config)
-        await _record(
-            session_factory, delivery_id, DeliveryStatus.PENDING, exc.description, tried=True
-        )
+            return await _give_up(
+                session_factory,
+                pending,
+                delivery_id,
+                error,
+                config,
+                receiver_failed=not exc.rate_limited,
+            )
+        await _record(session_factory, delivery_id, DeliveryStatus.PENDING, error, tried=True)
         defer = exc.retry_after if exc.retry_after is not None else config.backoff_seconds(attempt)
         logger.warning(
             "alert delivery failed, will retry",
@@ -199,8 +225,18 @@ async def _give_up(
     delivery_id: uuid.UUID,
     error: str,
     config: NotifyConfig,
+    *,
+    receiver_failed: bool = True,
 ) -> DeliveryOutcome:
-    await _fail(session_factory, pending, delivery_id, error, config, tried=True)
+    await _fail(
+        session_factory,
+        pending,
+        delivery_id,
+        error,
+        config,
+        tried=True,
+        receiver_failed=receiver_failed,
+    )
     logger.warning(
         "alert delivery failed permanently",
         extra={"delivery_id": str(delivery_id), "error": error},
@@ -216,14 +252,14 @@ async def _fail(
     config: NotifyConfig,
     *,
     tried: bool,
+    receiver_failed: bool,
 ) -> None:
-    """Mark the delivery failed and, for a webhook whose endpoint was actually tried, count
-    it towards deactivation, in one transaction."""
+    """Mark the delivery failed and, for a webhook whose endpoint failed it (not merely rate
+    limited it, and not never tried), count it towards deactivation, in one transaction."""
     recipient = pending.recipient
     async with session_factory() as session, session.begin():
         failed = await _update(session, delivery_id, DeliveryStatus.FAILED, error, tried=tried)
-        endpoint_was_tried = tried or pending.attempts > 0
-        if failed and recipient.channel is SubscriptionChannel.WEBHOOK and endpoint_was_tried:
+        if failed and recipient.channel is SubscriptionChannel.WEBHOOK and receiver_failed:
             await _count_consecutive_failure(session, recipient.subscription_id, config)
 
 
@@ -261,6 +297,7 @@ async def _load(
                 NotificationDelivery.subscription_id,
                 NotificationDelivery.earthquake_id,
                 NotificationDelivery.attempts,
+                NotificationDelivery.last_error,
                 Subscription.channel,
                 Subscription.telegram_chat_id,
                 Subscription.webhook_url,
@@ -315,7 +352,7 @@ async def _load(
         webhook_url=row.webhook_url,
         webhook_secret_encrypted=row.webhook_secret_encrypted,
     )
-    return _Pending(recipient, row.is_active, row.attempts, alert)
+    return _Pending(recipient, row.is_active, row.attempts, row.last_error, alert)
 
 
 async def _already_alerted_nearby(

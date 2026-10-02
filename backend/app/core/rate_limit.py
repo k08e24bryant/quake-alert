@@ -1,8 +1,10 @@
 """Per-client-IP fixed-window rate limiting in Redis.
 
-Fails open: if Redis is unreachable, requests are allowed, because the API must keep
-serving from the database when Redis is down. Calls go through the API's circuit breaker
-(GuardedRedis): while it is open, limiting is skipped without touching Redis or logging.
+Reads fail open: if Redis is unreachable, requests are allowed, because the API must keep
+serving from the database when Redis is down. Writes to webhook subscriptions fail
+closed: without a working limiter they answer 503, because each one makes us send a
+request to a URL of the caller's choosing (see README). Calls go through the API's circuit
+breaker (GuardedRedis): while it is open, Redis is not touched and nothing is logged.
 """
 
 import ipaddress
@@ -102,20 +104,41 @@ def client_ip(request: Request, trust_proxy_headers: bool) -> str:
 
 
 async def enforce_rate_limit(request: Request, response: Response) -> None:
-    """FastAPI dependency for /v1 routes: sets X-RateLimit-* headers, raises 429 when over."""
-    await _enforce(request.app.state.rate_limiter, request, response)
+    """FastAPI dependency for /v1 read routes: sets X-RateLimit-* headers, raises 429 when
+    over. Fails open."""
+    await _enforce(request.app.state.rate_limiter, request, response, fail_closed=False)
+
+
+async def enforce_rate_limit_fail_closed(request: Request, response: Response) -> None:
+    """The general /v1 limit for webhook subscription writes: like enforce_rate_limit, but
+    503 while the limiter is unavailable (Redis down or breaker open)."""
+    await _enforce(request.app.state.rate_limiter, request, response, fail_closed=True)
 
 
 async def enforce_subscription_write_limit(request: Request, response: Response) -> None:
-    """The stricter hourly limit for creating webhook subscriptions and sending test
-    payloads, applied on top of enforce_rate_limit. Its headers replace the general ones."""
-    await _enforce(request.app.state.subscription_write_limiter, request, response)
+    """The stricter hourly limit for creating webhook subscriptions, test payloads and
+    verification retries, on top of the general one. Its headers replace the general
+    ones. Fails closed."""
+    await _enforce(
+        request.app.state.subscription_write_limiter, request, response, fail_closed=True
+    )
 
 
-async def _enforce(limiter: "RateLimiter", request: Request, response: Response) -> None:
-    trust: bool = request.app.state.settings.trust_proxy_headers
-    decision = await limiter.hit(client_ip(request, trust))
+async def _enforce(
+    limiter: "RateLimiter", request: Request, response: Response, *, fail_closed: bool
+) -> None:
+    settings = request.app.state.settings
+    decision = await limiter.hit(client_ip(request, settings.trust_proxy_headers))
     if decision is None:
+        if fail_closed:
+            # Worth retrying once the breaker lets the next trial call through.
+            retry_after = math.ceil(settings.redis_breaker_open_seconds)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Rate limiting is unavailable, so subscription changes are paused. "
+                "Retry after the number of seconds in Retry-After.",
+                headers={"Retry-After": str(retry_after)},
+            )
         return
     if not decision.allowed:
         raise HTTPException(

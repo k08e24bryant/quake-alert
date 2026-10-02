@@ -379,9 +379,10 @@ receiver guide (payload, headers, verifying signatures, retries, trying it by ha
 
 | Endpoint | Does |
 |---|---|
-| `POST /v1/subscriptions/webhook` | Subscribes `url` near `lat`/`lon` (`radius_km` 10–1000, `min_magnitude` 2.0–9.0). Returns `signing_secret` and `manage_token` **once**. |
-| `DELETE /v1/subscriptions/webhook/{id}` | Hard-deletes it and its delivery history. Needs `Authorization: Bearer <manage_token>`. |
-| `POST /v1/subscriptions/webhook/{id}/test` | Sends one signed `webhook.test` payload (no quake data) now and reports the answer. Needs the token. |
+| `POST /v1/subscriptions/webhook` | Subscribes `url` near `lat`/`lon` (`radius_km` 10–1000, `min_magnitude` 2.0–9.0) as `pending_verification`, and sends the verification challenge once. Returns `signing_secret` and `manage_token` **once**. |
+| `POST /v1/subscriptions/webhook/{id}/verify` | Sends a new challenge to a pending subscription; `active` if the receiver echoes it. `409` unless pending. Needs `Authorization: Bearer <manage_token>`. |
+| `DELETE /v1/subscriptions/webhook/{id}` | Hard-deletes it and its delivery history. Needs the token. |
+| `POST /v1/subscriptions/webhook/{id}/test` | Sends one signed `webhook.test` payload (no quake data) now and reports the answer. `409` while pending. Needs the token. |
 
 **One pipeline for both channels.** Telegram and webhooks implement one `Notifier`
 interface (`app/notifications/base.py`). Everything else is shared, in
@@ -394,6 +395,27 @@ interface (`app/notifications/base.py`). Everything else is shared, in
 A notifier only turns an alert into one send attempt, and reports one of: sent, retry,
 recipient gone (deactivate), or permanent failure.
 
+**Ownership verification.** Anyone can type any URL into a subscription, so a new one is
+`pending_verification` until its receiver proves it wants our requests:
+- We send a signed `webhook.verification` request with a random 256-bit `challenge`; the
+  receiver must answer `2xx` within the normal 5 s timeout with
+  `{"challenge": "<same value>"}` (compared in constant time). It goes through the same
+  send path as alerts, SSRF checks included, with no bypass.
+- One attempt on creation, then one per `POST .../verify` (manage token, counted in the
+  hourly write limit). Failing leaves the subscription pending. Nothing retries by itself.
+- Pending means `is_active = false` and `verified_at IS NULL`. Matching only takes active
+  rows, and a CHECK constraint makes an active, unverified webhook row impossible, so a
+  pending subscription is never matched.
+- The daily prune (03:00 UTC) deletes subscriptions still pending
+  `WEBHOOK_PENDING_VERIFICATION_MAX_AGE_HOURS` (24) after they were created.
+- The creation-time attempt is sent before the response hands the owner the signing
+  secret, so a receiver that checks signatures answers it with `401`. That is by design
+  (docs/webhooks.md explains it to receivers): the owner stores the secret, then calls
+  `/verify`. A receiver that echoed unsigned challenges would let anyone verify a
+  subscription to its URL.
+- Migration `0010` turns webhook subscriptions created before verification existed into
+  pending ones: they never proved ownership either.
+
 **Webhook specifics:**
 - Coordinates are rounded to 2 decimals, as for Telegram.
 - The signature is `X-Quake-Signature: sha256=HMAC(secret, f"{timestamp}.{body}")`, with
@@ -401,10 +423,19 @@ recipient gone (deactivate), or permanent failure.
 - Status codes:
   - `2xx` is sent.
   - `410` deactivates the subscription.
+  - `429` retries after its `Retry-After` (delay-seconds or an HTTP date), capped at
+    `WEBHOOK_MAX_RETRY_AFTER_SECONDS` (300); without a usable header, the usual backoff.
+    It still uses up an attempt, and the freshness window is still checked before the
+    retry.
   - Other `4xx` and `3xx` fail without retry. Redirects are never followed.
   - `5xx`, timeouts and DNS failures retry: 5 attempts with exponential backoff.
 - After `WEBHOOK_MAX_CONSECUTIVE_FAILURES` (10) failed deliveries in a row, the
-  subscription is deactivated, and this is logged once.
+  subscription is deactivated, and this is logged once. A delivery whose last attempt got
+  a `429` doesn't count, even when it then runs out of attempts or expires: being asked
+  to slow down is not a broken endpoint. The dispatcher marks such attempts in
+  `last_error` (`rate limited: ...`), so the expiry check on a later attempt knows too.
+- An inactive subscription is never reactivated (`/verify` answers `409`): delete it and
+  create a new one.
 - Synthetic quakes are sent as `event: earthquake.test` with `synthetic: true`. The
   pipeline refuses to send any synthetic quake unless `ENVIRONMENT=development`.
 
@@ -417,8 +448,23 @@ recipient gone (deactivate), or permanent failure.
 - No redirects, no environment proxy, no pooled connections.
 - 5 s timeouts, and at most 64 KB of the response is read.
 
-Creating subscriptions and sending test payloads share a stricter limit of
-`SUBSCRIPTION_WRITE_RATE_LIMIT_PER_HOUR` (5) per IP, on top of the general one.
+Creating subscriptions, verifying them and sending test payloads share a stricter limit
+of `SUBSCRIPTION_WRITE_RATE_LIMIT_PER_HOUR` (5) per IP, on top of the general one.
+
+**Writes fail closed, reads fail open.** Every `POST`/`DELETE` under
+`/v1/subscriptions/webhook` needs a working rate limiter. While Redis is unreachable or
+the API's breaker is open, they answer `503` with `Retry-After` (the breaker's open
+period, `REDIS_BREAKER_OPEN_SECONDS`) instead of skipping the limit. Reads keep failing
+open. The two kinds of request carry different risks:
+- A read costs us a cached response or an indexed query, and refusing it during a Redis
+  outage would take quake data away from everyone. So availability wins.
+- A webhook write makes **this server send a request to a URL of the caller's choosing**:
+  creation and `/verify` send a verification request, and `/test` sends a test payload.
+  Without the limit, those endpoints would be an unmetered request cannon pointed at third
+  parties, and a creation flood would also fill the table. Pausing subscription changes
+  for a few minutes harms nobody: existing subscriptions keep receiving alerts, because the
+  worker doesn't use the API's limiter. `DELETE` sends nothing, but it fails closed too, so
+  the rule stays simple: every write to this resource needs the limiter.
 
 ### Signing secrets and key rotation
 
@@ -432,13 +478,31 @@ is only ever compared, so it is stored as a sha256 hash.
 - Generate a key:
   `uv run python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`
 
-**Rotating a key:**
-1. Put the new key **first**, keep the old ones after it, and restart the API and the
-   worker. New subscriptions are encrypted with the new key, and existing ones still
-   decrypt with the old one.
-2. An old key may only be removed once no stored secret needs it. Re-encrypting stored
-   secrets (`SecretBox.rotate`) has no command yet (see Out of scope). Until then, keep
-   old keys listed.
+**Rotating a key** (subscribers notice nothing: their signing secrets stay the same, only
+our encryption of them changes):
+1. **Add the new key first.** Generate it, put it **first** in `WEBHOOK_SECRET_KEYS` with
+   the old key(s) after it (`WEBHOOK_SECRET_KEYS=<new>,<old>`), and restart the API and
+   the worker. New subscriptions are now encrypted with the new key; existing secrets
+   still decrypt with the old one.
+2. **Re-encrypt the stored secrets** with the same settings (both keys listed). Check
+   first, then run:
+   ```sh
+   cd backend
+   uv run python -m scripts.rotate_webhook_secrets --dry-run
+   uv run python -m scripts.rotate_webhook_secrets
+   # in the containers: docker compose exec api python -m scripts.rotate_webhook_secrets
+   ```
+   It goes through every webhook subscription (pending and inactive ones included) in
+   batches of `--batch-size` (500), one transaction per batch. A secret the new key already
+   decrypts is skipped, so the command is idempotent: run it again and it reports `0`
+   re-encrypted. A secret no listed key can decrypt is reported by subscription id and
+   left alone, and the exit code is then `1`. Secrets are never printed.
+3. **Remove the old key** only once a run (or `--dry-run`) reports everything already on
+   the primary key. Restart the API and the worker with `WEBHOOK_SECRET_KEYS=<new>`.
+
+Order matters: running step 2 before every API and worker process uses the new key first
+would let a process still on the old key list encrypt new subscriptions with the old key
+after the run. If that happened, run step 2 again before removing the old key.
 
 If a secret's key is removed anyway, its deliveries fail with "signing secret cannot be
 decrypted"; nothing is ever sent unsigned. After 10 such failures the subscription is
@@ -446,18 +510,21 @@ deactivated.
 
 ### Webhooks: out of scope / known gaps
 
-- **No re-encryption command** for key rotation (see above).
 - **No reactivation.** A subscription deactivated by `410` or by consecutive failures stays
   inactive. Delete it and create a new one.
 - **A lost manage token can't be recovered**, because only its hash is stored. Subscribe
   again; the old subscription stops on its own after 10 failed deliveries, or is
-  deactivated by a `410`.
-- **`429` from a receiver is not retried**, as specified ("other 4xx: no retry"), and its
-  `Retry-After` is ignored.
-- **The hourly write limit fails open** while Redis is down, like every API rate limit.
-- **No proof of URL ownership.** Anyone can point a subscription at any public HTTPS URL.
-  The hourly limit, the public-address rule and auto-deactivation bound the damage. A
-  verification handshake (echoing a challenge) would close it.
+  deactivated by a `410`. A pending one is pruned after 24 h.
+- **Verification proves consent once.** A URL that changes hands after verification keeps
+  receiving alerts until it answers `410` or fails 10 deliveries in a row.
+- **The first verification attempt usually fails** for a receiver that checks signatures,
+  by design (see above). Owners have to call `/verify`.
+- **The verification request itself** still reaches an unverified URL, one per creation or
+  `/verify`. The hourly write limit (fail closed), the public-address rule and the 5 s
+  timeout bound that, and the request carries no quake data.
+- **Fail-closed writes depend on the per-process breaker.** Each API process decides on
+  its own whether Redis is usable, so during a partial outage some replicas may accept
+  writes while others answer `503`. Each accepted write was still counted by Redis.
 
 ## Design decisions
 
@@ -579,8 +646,10 @@ the edge burst. Both cost more Redis work per request.
 
 **API.** Redis holds only things the API can live without: cached responses and rate-limit
 counters. Every Redis failure degrades instead of erroring: the cache is bypassed, the rate
-limit fails open, and `/readyz` stays 200 with `"redis": "degraded"`. The circuit breaker
-covers the slow failure mode as well. A Redis that accepts connections but never answers
+limit fails open for reads, and `/readyz` stays 200 with `"redis": "degraded"`. The one
+exception is webhook subscription writes, which answer `503` without a limiter (see
+[Notifications (webhooks)](#notifications-webhooks)): pausing them costs nobody an
+alert. The circuit breaker covers the slow failure mode as well. A Redis that accepts connections but never answers
 would otherwise add a timeout to every request, and after a few failures the breaker stops
 calling it at all. Failing open on rate limiting during a Redis outage is a deliberate
 choice: availability of quake data matters more than enforcing a per-client quota for a few
@@ -655,7 +724,8 @@ docker compose up --build
 
 Webhook subscriptions need `WEBHOOK_SECRET_KEYS` in `backend/.env` (see
 [Signing secrets and key rotation](#signing-secrets-and-key-rotation)). Without it,
-`POST /v1/subscriptions/webhook` answers 503. To watch a real delivery, see "Trying it by
+`POST /v1/subscriptions/webhook` answers 503. To verify a real receiver and watch a
+delivery (through a temporary HTTPS tunnel, synthetic quakes only), see "Trying it by
 hand" in [docs/webhooks.md](docs/webhooks.md).
 
 To try the bot locally, create a bot with @BotFather and put its token in `backend/.env` as

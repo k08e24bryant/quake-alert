@@ -1,7 +1,10 @@
 import uuid
 from decimal import Decimal
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+
+WebhookStatusName = Literal["pending_verification", "active", "inactive"]
 
 
 class WebhookSubscriptionCreate(BaseModel):
@@ -20,6 +23,12 @@ class WebhookSubscriptionCreate(BaseModel):
     min_magnitude: Decimal = Field(ge=Decimal("2.0"), le=Decimal("9.0"), decimal_places=1)
 
 
+class WebhookVerification(BaseModel):
+    verified: bool = Field(description='The receiver answered 2xx with {"challenge": ...}.')
+    status_code: int | None = Field(description="The receiver's status code, if it was 2xx.")
+    error: str | None = Field(description="Why it was not verified.")
+
+
 class WebhookSubscriptionCreated(BaseModel):
     id: uuid.UUID
     url: str
@@ -27,7 +36,16 @@ class WebhookSubscriptionCreated(BaseModel):
     longitude: float
     radius_km: int
     min_magnitude: float
-    is_active: bool = True
+    status: WebhookStatusName = Field(
+        description=(
+            "`active` once the receiver echoed the verification challenge; until then "
+            "`pending_verification`: no alerts, and deleted after 24 h unless verified."
+        )
+    )
+    is_active: bool
+    verification: WebhookVerification = Field(
+        description="The verification request sent while creating the subscription."
+    )
     signing_secret: str = Field(
         description=(
             "HMAC-SHA256 key for X-Quake-Signature. Shown once: store it now. See docs/webhooks.md."
@@ -35,8 +53,8 @@ class WebhookSubscriptionCreated(BaseModel):
     )
     manage_token: str = Field(
         description=(
-            "Send as `Authorization: Bearer <token>` to delete or test this subscription. "
-            "Shown once: store it now."
+            "Send as `Authorization: Bearer <token>` to verify, test or delete this "
+            "subscription. Shown once: store it now."
         )
     )
 
@@ -45,3 +63,8 @@ class WebhookTestResult(BaseModel):
     delivered: bool = Field(description="The receiver answered 2xx.")
     status_code: int | None = Field(description="The receiver's status code, if it answered.")
     error: str | None = Field(description="Why it was not delivered.")
+
+
+class WebhookVerifyResult(BaseModel):
+    status: WebhookStatusName
+    verification: WebhookVerification

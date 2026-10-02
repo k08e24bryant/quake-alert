@@ -4,7 +4,8 @@ import hashlib
 import hmac
 import json
 import socket
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from typing import Any
 
 import httpx
@@ -51,3 +52,27 @@ def posted(route: respx.Route) -> list[httpx.Request]:
 def payload(request: httpx.Request) -> dict[str, Any]:
     body: dict[str, Any] = json.loads(request.content)
     return body
+
+
+@dataclass
+class FakeReceiver:
+    """A respx side effect playing a well-behaved receiver: answers a verification request
+    by echoing its challenge (unless `verification` says otherwise) and everything else
+    with `status`/`text`."""
+
+    status: int = 204
+    text: str = ""
+    verification: Callable[[dict[str, Any]], httpx.Response] | None = None
+    requests: list[httpx.Request] = field(default_factory=list)
+
+    def events(self) -> list[str]:
+        return [payload(request)["event"] for request in self.requests]
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        body = payload(request)
+        if body["event"] == "webhook.verification":
+            if self.verification is not None:
+                return self.verification(body)
+            return httpx.Response(200, json={"challenge": body["challenge"]})
+        return httpx.Response(self.status, text=self.text)

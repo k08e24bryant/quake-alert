@@ -62,6 +62,7 @@ async def test_prune_job_deletes_expired_runs_but_keeps_the_latest_success(
     assert await prune_old_records(worker_ctx) == {
         "ingestion_runs": 3,
         "notification_deliveries": 0,
+        "pending_webhook_subscriptions": 0,
     }
 
     async with session_factory() as session:
