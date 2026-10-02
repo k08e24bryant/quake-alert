@@ -77,12 +77,25 @@ def bearer(token: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {token}"}
 
 
+async def verify(api: AsyncClient, created: dict[str, Any]) -> httpx.Response:
+    return await api.post(
+        f"{ENDPOINT}/{created['id']}/verify", headers=bearer(created["manage_token"])
+    )
+
+
+async def create_verified(api: AsyncClient) -> dict[str, Any]:
+    """Create, then verify against the (echoing) receiver: an active subscription."""
+    created: dict[str, Any] = (await create(api)).json()
+    assert (await verify(api, created)).json()["status"] == "active"
+    return created
+
+
 # --- create ---------------------------------------------------------------------------------
 
 
 @pytest.mark.usefixtures("webhooks_enabled")
 async def test_create_returns_credentials_once_and_stores_them_safely(
-    api: AsyncClient, db_session: AsyncSession
+    api: AsyncClient, db_session: AsyncSession, receiver: FakeReceiver
 ) -> None:
     response = await create(api)
 
@@ -92,12 +105,13 @@ async def test_create_returns_credentials_once_and_stores_them_safely(
     assert body["manage_token"].startswith("qamt_")
     assert (body["latitude"], body["longitude"]) == (-6.21, 106.85)  # rounded, ~1 km
     assert (body["radius_km"], body["min_magnitude"]) == (200, 4.5)
-    # The receiver echoed the challenge while the subscription was created.
-    assert (body["status"], body["is_active"]) == ("active", True)
-    assert body["verification"] == {"verified": True, "status_code": 200, "error": None}
+    # Pending until POST .../verify; creating it sends nothing to the URL.
+    assert (body["status"], body["is_active"]) == ("pending_verification", False)
+    assert "verification" not in body
+    assert receiver.requests == []
     row = await db_session.get(Subscription, uuid.UUID(body["id"]))
     assert row is not None
-    assert (row.is_active, row.verified_at is not None) == (True, True)
+    assert (row.is_active, row.verified_at) == (False, None)
     assert row.webhook_secret_encrypted is not None
     # The secret is encrypted (recoverable for signing), the token only hashed.
     assert body["signing_secret"] not in row.webhook_secret_encrypted
@@ -251,9 +265,9 @@ async def test_creating_is_limited_per_ip_per_hour(api: AsyncClient) -> None:
 
 @pytest.mark.usefixtures("webhooks_enabled")
 async def test_test_payloads_share_the_write_budget(api: AsyncClient) -> None:
-    created = (await create(api)).json()
+    created = await create_verified(api)  # 2 of the 5 writes
     test_url = f"{ENDPOINT}/{created['id']}/test"
-    for _ in range(4):
+    for _ in range(3):
         assert (
             await api.post(test_url, headers=bearer(created["manage_token"]))
         ).status_code == 200
@@ -268,7 +282,7 @@ async def test_test_payloads_share_the_write_budget(api: AsyncClient) -> None:
 async def test_test_endpoint_sends_a_signed_test_payload(
     api: AsyncClient, receiver: FakeReceiver
 ) -> None:
-    created = (await create(api)).json()
+    created = await create_verified(api)
 
     response = await api.post(
         f"{ENDPOINT}/{created['id']}/test", headers=bearer(created["manage_token"])
@@ -295,7 +309,7 @@ async def test_test_endpoint_reports_a_failing_receiver(
     api: AsyncClient, receiver: FakeReceiver
 ) -> None:
     receiver.status, receiver.text = 500, "boom"
-    created = (await create(api)).json()
+    created = await create_verified(api)
 
     response = await api.post(
         f"{ENDPOINT}/{created['id']}/test", headers=bearer(created["manage_token"])
@@ -308,7 +322,7 @@ async def test_test_endpoint_reports_a_failing_receiver(
 async def test_test_endpoint_needs_the_manage_token(
     api: AsyncClient, receiver: FakeReceiver
 ) -> None:
-    created = (await create(api)).json()
+    created = await create_verified(api)
 
     response = await api.post(f"{ENDPOINT}/{created['id']}/test", headers=bearer("qamt_wrong"))
 
@@ -320,7 +334,6 @@ async def test_test_endpoint_needs_the_manage_token(
 async def test_test_endpoint_refuses_a_pending_subscription(
     api: AsyncClient, receiver: FakeReceiver
 ) -> None:
-    receiver.verification = lambda _: httpx.Response(401)
     created = (await create(api)).json()
 
     response = await api.post(
@@ -329,7 +342,7 @@ async def test_test_endpoint_refuses_a_pending_subscription(
 
     assert response.status_code == 409
     assert "pending verification" in response.json()["detail"]
-    assert receiver.events() == ["webhook.verification"]
+    assert receiver.requests == []
 
 
 # --- startup --------------------------------------------------------------------------------
@@ -367,11 +380,19 @@ async def row_state(session: AsyncSession, subscription_id: str) -> tuple[bool, 
 
 
 @pytest.mark.usefixtures("webhooks_enabled")
-async def test_verification_request_is_signed_and_carries_a_fresh_challenge(
-    api: AsyncClient, receiver: FakeReceiver
+async def test_verify_sends_a_signed_challenge_and_activates_on_the_echo(
+    api: AsyncClient, db_session: AsyncSession, receiver: FakeReceiver
 ) -> None:
     created = (await create(api)).json()
 
+    response = await verify(api, created)
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "active",
+        "verification": {"verified": True, "status_code": 200, "error": None},
+    }
+    assert await row_state(db_session, created["id"]) == (True, True)
     [request] = receiver.requests
     # The same send path as alerts: the vetted IP, the subscriber's Host, a signature.
     assert request.url.host == PUBLIC_IP
@@ -388,8 +409,23 @@ async def test_verification_request_is_signed_and_carries_a_fresh_challenge(
         None,
     )
     assert len(body["challenge"]) >= 40  # 256 random bits, urlsafe base64
-    await create(api)
-    assert payload(receiver.requests[1])["challenge"] != body["challenge"]
+
+
+@pytest.mark.usefixtures("webhooks_enabled")
+async def test_every_verify_call_sends_a_fresh_challenge(
+    api: AsyncClient, db_session: AsyncSession, receiver: FakeReceiver
+) -> None:
+    receiver.verification = lambda _: httpx.Response(401)  # secret not installed yet
+    created = (await create(api)).json()
+
+    first = await verify(api, created)
+    receiver.verification = None  # now it is
+    second = await verify(api, created)
+
+    assert (first.json()["status"], second.json()["status"]) == ("pending_verification", "active")
+    challenges = [payload(request)["challenge"] for request in receiver.requests]
+    assert len(set(challenges)) == 2
+    assert await row_state(db_session, created["id"]) == (True, True)
 
 
 @pytest.mark.usefixtures("webhooks_enabled")
@@ -416,16 +452,16 @@ async def test_wrong_answer_leaves_the_subscription_pending(
     error: str,
 ) -> None:
     receiver.verification = answer
+    created = (await create(api)).json()
 
-    response = await create(api)
+    response = await verify(api, created)
 
-    assert response.status_code == 201  # created all the same: the owner can retry
+    assert response.status_code == 200
     body = response.json()
-    assert (body["status"], body["is_active"]) == ("pending_verification", False)
+    assert body["status"] == "pending_verification"
     assert body["verification"]["verified"] is False
     assert error in body["verification"]["error"]
-    assert body["manage_token"] and body["signing_secret"]
-    assert await row_state(db_session, body["id"]) == (False, False)
+    assert await row_state(db_session, created["id"]) == (False, False)
     assert len(receiver.requests) == 1  # one attempt, never retried by itself
 
 
@@ -437,12 +473,15 @@ async def test_verification_timeout_leaves_the_subscription_pending(
         raise httpx.ReadTimeout("no answer in time")
 
     receiver.verification = too_slow
+    created = (await create(api)).json()
 
-    body = (await create(api)).json()
+    body = (await verify(api, created)).json()
 
-    assert body["status"] == "pending_verification"
-    assert body["verification"] == {"verified": False, "status_code": None, "error": "timeout"}
-    assert await row_state(db_session, body["id"]) == (False, False)
+    assert body == {
+        "status": "pending_verification",
+        "verification": {"verified": False, "status_code": None, "error": "timeout"},
+    }
+    assert await row_state(db_session, created["id"]) == (False, False)
 
 
 async def test_verification_goes_through_the_ssrf_check_at_send_time(
@@ -452,7 +491,7 @@ async def test_verification_goes_through_the_ssrf_check_at_send_time(
     webhook_http: httpx.AsyncClient,
     respx_mock: respx.MockRouter,
 ) -> None:
-    # DNS rebinding: public when the URL is checked, internal a moment later when the
+    # DNS rebinding: public when the URL is checked at creation, internal by the time the
     # verification request is sent. The send-time check refuses it.
     answers = iter([[PUBLIC_IP], ["127.0.0.1"]])
 
@@ -468,50 +507,13 @@ async def test_verification_goes_through_the_ssrf_check_at_send_time(
         max_response_bytes=65536,
         resolver=rebinding,
     )
+    created = (await create(api)).json()
 
-    body = (await create(api)).json()
+    body = (await verify(api, created)).json()
 
     assert not anything.called
     assert body["status"] == "pending_verification"
     assert "unsafe webhook target" in body["verification"]["error"]
-    assert await row_state(db_session, body["id"]) == (False, False)
-
-
-@pytest.mark.usefixtures("webhooks_enabled")
-async def test_verify_retry_activates_a_pending_subscription(
-    api: AsyncClient, db_session: AsyncSession, receiver: FakeReceiver
-) -> None:
-    receiver.verification = lambda _: httpx.Response(401)  # doesn't know the secret yet
-    created = (await create(api)).json()
-    receiver.verification = None  # now it does
-
-    response = await api.post(
-        f"{ENDPOINT}/{created['id']}/verify", headers=bearer(created["manage_token"])
-    )
-
-    assert response.status_code == 200
-    assert response.json() == {
-        "status": "active",
-        "verification": {"verified": True, "status_code": 200, "error": None},
-    }
-    assert await row_state(db_session, created["id"]) == (True, True)
-    assert receiver.events() == ["webhook.verification", "webhook.verification"]
-
-
-@pytest.mark.usefixtures("webhooks_enabled")
-async def test_failed_verify_retry_keeps_it_pending(
-    api: AsyncClient, db_session: AsyncSession, receiver: FakeReceiver
-) -> None:
-    receiver.verification = lambda _: httpx.Response(200, json={"challenge": "wrong"})
-    created = (await create(api)).json()
-
-    response = await api.post(
-        f"{ENDPOINT}/{created['id']}/verify", headers=bearer(created["manage_token"])
-    )
-
-    assert response.status_code == 200
-    assert response.json()["status"] == "pending_verification"
-    assert response.json()["verification"]["verified"] is False
     assert await row_state(db_session, created["id"]) == (False, False)
 
 
@@ -520,9 +522,7 @@ async def test_failed_verify_retry_keeps_it_pending(
 async def test_verify_needs_the_manage_token(
     api: AsyncClient, receiver: FakeReceiver, headers: dict[str, str]
 ) -> None:
-    receiver.verification = lambda _: httpx.Response(401)
     created = (await create(api)).json()
-    receiver.verification = None
 
     response = await api.post(f"{ENDPOINT}/{created['id']}/verify", headers=headers)
     unknown = await api.post(
@@ -530,23 +530,22 @@ async def test_verify_needs_the_manage_token(
     )
 
     assert (response.status_code, response.json()) == (404, unknown.json())
-    assert len(receiver.requests) == 1  # only the creation attempt
+    assert receiver.requests == []
 
 
 @pytest.mark.usefixtures("webhooks_enabled")
 async def test_verify_never_reactivates_and_sends_nothing_unless_pending(
     api: AsyncClient, db_session: AsyncSession, receiver: FakeReceiver
 ) -> None:
-    created = (await create(api)).json()
-    verify = f"{ENDPOINT}/{created['id']}/verify"
+    created = await create_verified(api)
 
-    already = await api.post(verify, headers=bearer(created["manage_token"]))
+    already = await verify(api, created)
     # Deactivated, e.g. by a 410 or by consecutive failures.
     row = await db_session.get(Subscription, uuid.UUID(created["id"]))
     assert row is not None
     row.is_active = False
     await db_session.flush()
-    inactive = await api.post(verify, headers=bearer(created["manage_token"]))
+    inactive = await verify(api, created)
 
     assert (already.status_code, already.json()["detail"]) == (
         409,
@@ -555,23 +554,22 @@ async def test_verify_never_reactivates_and_sends_nothing_unless_pending(
     assert inactive.status_code == 409
     assert "never reactivated" in inactive.json()["detail"]
     assert await row_state(db_session, created["id"]) == (False, True)
-    assert len(receiver.requests) == 1  # only the creation attempt
+    assert len(receiver.requests) == 1  # only the successful verification
 
 
 @pytest.mark.usefixtures("webhooks_enabled")
-async def test_verify_retries_share_the_write_budget(
+async def test_verify_calls_share_the_write_budget(
     api: AsyncClient, receiver: FakeReceiver
 ) -> None:
     receiver.verification = lambda _: httpx.Response(401)
     created = (await create(api)).json()
-    verify = f"{ENDPOINT}/{created['id']}/verify"
     for _ in range(4):
-        assert (await api.post(verify, headers=bearer(created["manage_token"]))).status_code == 200
+        assert (await verify(api, created)).status_code == 200
 
-    limited = await api.post(verify, headers=bearer(created["manage_token"]))
+    limited = await verify(api, created)
 
     assert limited.status_code == 429
-    assert len(receiver.requests) == 5  # the limited call sent nothing
+    assert len(receiver.requests) == 4  # the limited call sent nothing
 
 
 # --- writes fail closed without the rate limiter --------------------------------------------

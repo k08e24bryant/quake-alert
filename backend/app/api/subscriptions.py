@@ -96,13 +96,13 @@ def _verification(result: VerificationResult) -> WebhookVerification:
 async def create_subscription(
     body: WebhookSubscriptionCreate, session: SessionDep, notifier: NotifierDep
 ) -> WebhookSubscriptionCreated:
-    """Subscribe a URL to signed alerts for quakes near a point. The signing secret and the
-    manage token are in this response only: store them now.
+    """Subscribe a URL to signed alerts for quakes near a point, as
+    `pending_verification`. The signing secret and the manage token are in this response
+    only: store them now.
 
-    A signed `webhook.verification` request is sent right away; the subscription becomes
-    `active` only when the receiver answers 2xx with `{"challenge": "<the challenge>"}`.
-    Otherwise it stays `pending_verification` (201 all the same): retry with POST
-    .../verify once the receiver is ready."""
+    Nothing is sent to the URL yet. Put the signing secret in your receiver, then call
+    POST .../verify: the subscription becomes `active` when the receiver answers that
+    signed challenge with `{"challenge": "<the challenge>"}`."""
     try:
         created = await create_webhook_subscription(
             session,
@@ -112,7 +112,6 @@ async def create_subscription(
             longitude=body.lon,
             radius_km=body.radius_km,
             min_magnitude=body.min_magnitude,
-            now=datetime.now(UTC),
         )
     except WebhookChannelUnavailableError:
         raise HTTPException(
@@ -120,7 +119,6 @@ async def create_subscription(
         ) from None
     except (UnsafeTargetError, DnsResolutionError) as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, f"url: {exc}") from None
-    current = created.verification.status
     return WebhookSubscriptionCreated(
         id=created.id,
         url=created.url,
@@ -128,9 +126,6 @@ async def create_subscription(
         longitude=float(created.longitude),
         radius_km=created.radius_km,
         min_magnitude=float(created.min_magnitude),
-        status=current.value,
-        is_active=current is WebhookStatus.ACTIVE,
-        verification=_verification(created.verification.result),
         signing_secret=created.signing_secret,
         manage_token=created.manage_token,
     )

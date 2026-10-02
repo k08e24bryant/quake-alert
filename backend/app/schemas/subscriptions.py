@@ -36,16 +36,14 @@ class WebhookSubscriptionCreated(BaseModel):
     longitude: float
     radius_km: int
     min_magnitude: float
-    status: WebhookStatusName = Field(
+    status: Literal["pending_verification"] = Field(
+        default="pending_verification",
         description=(
-            "`active` once the receiver echoed the verification challenge; until then "
-            "`pending_verification`: no alerts, and deleted after 24 h unless verified."
-        )
+            "Always `pending_verification`: no alerts until POST .../verify succeeds, and "
+            "deleted after 24 h unless verified. Nothing has been sent to the URL yet."
+        ),
     )
-    is_active: bool
-    verification: WebhookVerification = Field(
-        description="The verification request sent while creating the subscription."
-    )
+    is_active: bool = False
     signing_secret: str = Field(
         description=(
             "HMAC-SHA256 key for X-Quake-Signature. Shown once: store it now. See docs/webhooks.md."

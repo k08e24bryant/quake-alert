@@ -8,8 +8,9 @@
 
 Lifecycle: pending_verification -> active -> inactive, never backwards.
 - A new subscription is pending (inactive, so never matched) until its receiver echoes a
-  verification challenge: tried once on creation, then again on each POST .../verify.
-  Still pending a day later -> deleted by the daily prune.
+  verification challenge. Creating it never contacts the URL: the owner stores the
+  signing secret in the receiver first, then POST .../verify sends the challenge (once
+  per call). Still pending a day later -> deleted by the daily prune.
 - Active subscriptions are deactivated by a 410 or by consecutive failed deliveries.
   Nothing reactivates them: delete and create a new one.
 """
@@ -68,7 +69,6 @@ class CreatedWebhookSubscription:
     min_magnitude: Decimal
     signing_secret: str
     manage_token: str
-    verification: Verification
 
 
 def hash_token(token: str) -> str:
@@ -84,16 +84,16 @@ async def create_webhook_subscription(
     longitude: float,
     radius_km: int,
     min_magnitude: Decimal,
-    now: datetime,
 ) -> CreatedWebhookSubscription:
-    """Store the subscription as pending, then try to verify it once. The credentials are
-    returned either way: the owner needs the manage token to retry the verification.
+    """Store the subscription as pending verification. No request is sent to the URL: the
+    receiver can't know the signing secret before this returns it.
 
     Raises UnsafeTargetError / DnsResolutionError for a URL that may not be called."""
     box = notifier.secret_box
     if box is None:
         raise WebhookChannelUnavailableError
-    # Checked now so obvious mistakes fail early; the check that matters runs at send time.
+    # Checked now (a DNS lookup, no request) so obvious mistakes fail early; the check that
+    # matters runs at send time.
     await notifier.check_url(url)
     signing_secret = SECRET_PREFIX + secrets.token_urlsafe(32)
     manage_token = MANAGE_TOKEN_PREFIX + secrets.token_urlsafe(32)
@@ -112,7 +112,6 @@ async def create_webhook_subscription(
     async with session.begin():
         session.add(row)
         await session.flush()
-    verification = await verify_webhook_subscription(session, notifier, row, now=now)
     return CreatedWebhookSubscription(
         id=row.id,
         url=url,
@@ -122,7 +121,6 @@ async def create_webhook_subscription(
         min_magnitude=min_magnitude,
         signing_secret=signing_secret,
         manage_token=manage_token,
-        verification=verification,
     )
 
 

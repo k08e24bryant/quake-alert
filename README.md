@@ -379,7 +379,7 @@ receiver guide (payload, headers, verifying signatures, retries, trying it by ha
 
 | Endpoint | Does |
 |---|---|
-| `POST /v1/subscriptions/webhook` | Subscribes `url` near `lat`/`lon` (`radius_km` 10–1000, `min_magnitude` 2.0–9.0) as `pending_verification`, and sends the verification challenge once. Returns `signing_secret` and `manage_token` **once**. |
+| `POST /v1/subscriptions/webhook` | Subscribes `url` near `lat`/`lon` (`radius_km` 10–1000, `min_magnitude` 2.0–9.0) as `pending_verification`, without contacting the URL. Returns `signing_secret` and `manage_token` **once**. |
 | `POST /v1/subscriptions/webhook/{id}/verify` | Sends a new challenge to a pending subscription; `active` if the receiver echoes it. `409` unless pending. Needs `Authorization: Bearer <manage_token>`. |
 | `DELETE /v1/subscriptions/webhook/{id}` | Hard-deletes it and its delivery history. Needs the token. |
 | `POST /v1/subscriptions/webhook/{id}/test` | Sends one signed `webhook.test` payload (no quake data) now and reports the answer. `409` while pending. Needs the token. |
@@ -401,18 +401,20 @@ recipient gone (deactivate), or permanent failure.
   receiver must answer `2xx` within the normal 5 s timeout with
   `{"challenge": "<same value>"}` (compared in constant time). It goes through the same
   send path as alerts, SSRF checks included, with no bypass.
-- One attempt on creation, then one per `POST .../verify` (manage token, counted in the
-  hourly write limit). Failing leaves the subscription pending. Nothing retries by itself.
+- Creating a subscription never contacts the URL (only its DNS answer is checked). The
+  only verification request is sent by `POST .../verify`, one per call (manage token,
+  counted in the hourly write limit). Failing leaves the subscription pending. Nothing
+  retries by itself.
 - Pending means `is_active = false` and `verified_at IS NULL`. Matching only takes active
   rows, and a CHECK constraint makes an active, unverified webhook row impossible, so a
   pending subscription is never matched.
 - The daily prune (03:00 UTC) deletes subscriptions still pending
   `WEBHOOK_PENDING_VERIFICATION_MAX_AGE_HOURS` (24) after they were created.
-- The creation-time attempt is sent before the response hands the owner the signing
-  secret, so a receiver that checks signatures answers it with `401`. That is by design
-  (docs/webhooks.md explains it to receivers): the owner stores the secret, then calls
-  `/verify`. A receiver that echoed unsigned challenges would let anyone verify a
-  subscription to its URL.
+- The flow is create → store the signing secret in the receiver → `/verify`. A receiver
+  can only check the challenge's signature once it has the secret, which the create
+  response hands out; so creation sends nothing, rather than a request that a correct
+  receiver would have to reject. A receiver that echoed unsigned challenges would let
+  anyone verify a subscription to its URL.
 - Migration `0010` turns webhook subscriptions created before verification existed into
   pending ones: they never proved ownership either.
 
@@ -459,9 +461,9 @@ open. The two kinds of request carry different risks:
 - A read costs us a cached response or an indexed query, and refusing it during a Redis
   outage would take quake data away from everyone. So availability wins.
 - A webhook write makes **this server send a request to a URL of the caller's choosing**:
-  creation and `/verify` send a verification request, and `/test` sends a test payload.
-  Without the limit, those endpoints would be an unmetered request cannon pointed at third
-  parties, and a creation flood would also fill the table. Pausing subscription changes
+  `/verify` sends a verification request, and `/test` sends a test payload. Without the
+  limit, those endpoints would be an unmetered request cannon pointed at third parties,
+  and a creation flood would fill the table. Pausing subscription changes
   for a few minutes harms nobody: existing subscriptions keep receiving alerts, because the
   worker doesn't use the API's limiter. `DELETE` sends nothing, but it fails closed too, so
   the rule stays simple: every write to this resource needs the limiter.
@@ -517,10 +519,8 @@ deactivated.
   deactivated by a `410`. A pending one is pruned after 24 h.
 - **Verification proves consent once.** A URL that changes hands after verification keeps
   receiving alerts until it answers `410` or fails 10 deliveries in a row.
-- **The first verification attempt usually fails** for a receiver that checks signatures,
-  by design (see above). Owners have to call `/verify`.
-- **The verification request itself** still reaches an unverified URL, one per creation or
-  `/verify`. The hourly write limit (fail closed), the public-address rule and the 5 s
+- **The verification request itself** still reaches an unverified URL, one per
+  `/verify` call. The hourly write limit (fail closed), the public-address rule and the 5 s
   timeout bound that, and the request carries no quake data.
 - **Fail-closed writes depend on the per-process breaker.** Each API process decides on
   its own whether Redis is usable, so during a partial outage some replicas may accept

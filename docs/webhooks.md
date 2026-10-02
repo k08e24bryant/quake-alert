@@ -32,8 +32,9 @@ curl -X POST https://<api>/v1/subscriptions/webhook \
 | `radius_km` | Whole km, 10–1000. |
 | `min_magnitude` | 2.0–9.0, at most one decimal. |
 
-Before answering, the API sends your URL a signed verification request. The `201`
-response says how that went, and it is the **only** time you see the two credentials:
+Creating a subscription sends **nothing** to your URL (the host name is only resolved,
+to check the [target rules](#target-rules)). The `201` response is the **only** time you
+see the two credentials:
 
 ```json
 {
@@ -42,7 +43,6 @@ response says how that went, and it is the **only** time you see the two credent
   "latitude": -6.21, "longitude": 106.85, "radius_km": 200, "min_magnitude": 4.5,
   "status": "pending_verification",
   "is_active": false,
-  "verification": {"verified": false, "status_code": null, "error": "HTTP 401"},
   "signing_secret": "whsec_…",
   "manage_token": "qamt_…"
 }
@@ -51,9 +51,10 @@ response says how that went, and it is the **only** time you see the two credent
 - `signing_secret` verifies every request we send you. We store it encrypted.
 - `manage_token` verifies, tests or deletes the subscription. We store only its hash, so
   a lost token can't be recovered: subscribe again.
-- `status` is `active` if your receiver already echoed the challenge, otherwise
-  `pending_verification`. A pending subscription gets no alerts. See
-  [Verification](#verification) for why the first attempt usually fails, and what to do.
+- `status` is always `pending_verification` here. A pending subscription gets no alerts
+  until you [verify](#verification) it.
+
+So the flow is: **create → store `signing_secret` in your receiver → `POST .../verify`**.
 
 Creating subscriptions, verifying them and sending test payloads share a limit of
 `SUBSCRIPTION_WRITE_RATE_LIMIT_PER_HOUR` (5) per IP per hour. That is on top of the
@@ -64,8 +65,17 @@ limit. Try again after that many seconds.
 ## Verification
 
 Anyone could type your URL into a subscription, so we only send alerts to a receiver that
-has said yes. On creation, and again on every `POST .../verify`, we send one signed
-request (the usual headers, see [The request](#the-request)) with this body:
+has said yes. Once your receiver has the `signing_secret`, call:
+
+```sh
+curl -X POST https://<api>/v1/subscriptions/webhook/<id>/verify \
+  -H 'Authorization: Bearer <manage_token>'
+# -> {"status": "active", "verification": {"verified": true, "status_code": 200, "error": null}}
+```
+
+Each call sends your URL one signed request (the usual headers, see
+[The request](#the-request)) with this body. It is the only verification request we
+ever send; nothing is sent when the subscription is created.
 
 ```json
 {
@@ -89,23 +99,15 @@ challenge:
 {"challenge": "Zq3x…"}
 ```
 
-Anything else leaves the subscription `pending_verification`: a different or missing
-value, a body that is not a JSON object, a non-`2xx` status (`429` included; nothing
-here is retried), a redirect, or a timeout. Each attempt carries a new challenge.
+Anything else leaves the subscription `pending_verification`, and the `/verify`
+response says why (`"verified": false` and an `error`): a different or missing value, a
+body that is not a JSON object, a non-`2xx` status (`429` included; nothing here is
+retried by itself), a redirect, or a timeout. Fix the receiver and call `/verify`
+again; each call carries a new challenge and counts towards the hourly write limit.
 
-**The first attempt usually fails, and that is expected.** It is sent while your
-subscription is being created, before the response has given you `signing_secret`, so
-a receiver that checks signatures (as it should) can only answer `401`. Store the
-secret in your receiver, then ask for a new attempt:
-
-```sh
-curl -X POST https://<api>/v1/subscriptions/webhook/<id>/verify \
-  -H 'Authorization: Bearer <manage_token>'
-# -> {"status": "active", "verification": {"verified": true, "status_code": 200, "error": null}}
-```
-
-Don't skip the signature check for verification requests to make the first attempt
-pass: then anyone could verify a subscription to your URL.
+Check the signature on verification requests too, as the example below does. A
+receiver that echoed unsigned challenges would let anyone verify a subscription to its
+URL.
 
 - A subscription still pending 24 hours after it was created is deleted
   (`WEBHOOK_PENDING_VERIFICATION_MAX_AGE_HOURS`). Retries don't extend that.
@@ -196,7 +198,7 @@ X-Quake-Signature: sha256=5f0c…
 | `earthquake.alert` | A real quake from BMKG | `false` | `false` | the quake |
 | `earthquake.test` | A synthetic quake from `scripts/dev_fake_quake.py`. Impossible outside `ENVIRONMENT=development`. | `false` | `true` | the synthetic quake |
 | `webhook.test` | `POST /v1/subscriptions/webhook/{id}/test` | `true` | `false` | `null` |
-| `webhook.verification` | Creating a subscription, and `POST .../verify`. Also has `challenge`. | `true` | `false` | `null` |
+| `webhook.verification` | `POST /v1/subscriptions/webhook/{id}/verify`. Also has `challenge`. | `true` | `false` | `null` |
 
 Never act on a payload with `"synthetic": true` or `"test": true` as if a real quake
 happened.
@@ -355,8 +357,8 @@ subscribed (see [Target rules](#target-rules)); the tunnel's public hostname can
    curl -X POST http://localhost:8000/v1/subscriptions/webhook -H 'Content-Type: application/json' \
      -d '{"url": "https://<tunnel-host>/quake", "lat": -6.21, "lon": 106.85, "radius_km": 50, "min_magnitude": 9.0}'
    ```
-   Save `id`, `signing_secret` and `manage_token`. The status is `pending_verification`:
-   the receiver isn't running yet, so the challenge got an error from the tunnel.
+   Save `id`, `signing_secret` and `manage_token`. The status is `pending_verification`,
+   and nothing has been sent to the tunnel yet.
 4. Start the receiver with the secret:
    ```sh
    QUAKE_WEBHOOK_SECRET='<signing_secret>' python quake_receiver.py
